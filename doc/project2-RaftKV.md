@@ -14,7 +14,7 @@ The project have 3 parts you need to do, including:
 
 ### The Code
 
-In this part, you will implement the basic raft algorithm. The code you need to implement is under `raft/`. Inside `raft/`, there are some skeleton code and test cases waiting for you. The raft algorithm you're gonna implement here has a well designed interface with the upper application. Moreover, it uses a logical clock (named tick here) to measure the election and heartbeat timeout instead of a physical clock. That is to say, do not set a timer in the Raft module itself, and the upper application is responsible to advance the logical clock by calling `RawNode.Tick()`. Apart from that, messages sending and receiving along with other things are processed in an asynchronous way, it is also up to the upper application when to actually do these things (see below for more detail). For example, Raft will not block wait on the response of  any request message.
+In this part, you will implement the basic raft algorithm. The code you need to implement is under `raft/`. Inside `raft/`, there are some skeleton code and test cases waiting for you. The raft algorithm you're gonna implement here has a well-designed interface with the upper application. Moreover, it uses a logical clock (named tick here) to measure the election and heartbeat timeout instead of a physical clock. That is to say, do not set a timer in the Raft module itself, and the upper application is responsible to advance the logical clock by calling `RawNode.Tick()`. Apart from that, messages sending and receiving along with other things are processed in an asynchronous way, it is also up to the upper application when to actually do these things (see below for more detail). For example, Raft will not block wait on the response of  any request message.
 
 Before implementing, please checkout the hints for this part first. Also, you should take a rough look at the proto file `proto/proto/eraftpb.proto`. Raft sends and receives messages and related structs are defined there, you’ll use them for the implementation. Note that, unlike Raft paper, it divides Heartbeat and AppendEntries into different messages to make the logic more clear.
 
@@ -61,7 +61,7 @@ You can run `make project2ac` to test the implementation and run `make project2a
 > - Add any state you need to `raft.Raft`, `raft.RaftLog`, `raft.RawNode` and message on `eraftpb.proto`
 > - The tests assume that the first time start raft should have term 0
 > - The tests assume that the new elected leader should append a noop entry on its term
-> - The tests doesn’t set term for the local messages, `MessageType_MsgHup`, `MessageType_MsgBeat` and `MessageType_MsgPropose`.
+> - The tests don't set term for the local messages, `MessageType_MsgHup`, `MessageType_MsgBeat` and `MessageType_MsgPropose`.
 > - The log entries append are quite different between leader and non-leader, there are different sources, checking and handling, be careful with that.
 > - Don’t forget the election timeout should be different between peers.
 > - Some wrapper functions in `rawnode.go` can implement with `raft.Step(local message)`
@@ -94,7 +94,7 @@ Then, here comes the core of TinyKV — raftstore. The structure is a little com
 - <https://pingcap.com/blog-cn/the-design-and-implementation-of-multi-raft/#raftstore>  (Chinese Version)
 - <https://pingcap.com/blog/2017-08-15-multi-raft/#raftstore> (English Version)
 
-The entrance of raftstore is `Raftstore`, see `kv/raftstore/raftstore.go`.  It starts some workers to handle specific tasks asynchronously,  and most of them aren’t used now so you can just ignore them. All you need to focus on is `raftWorker`.(kv/raftstore/raft_worker.go)
+The entrance of raftstore is `Raftstore`, see `kv/raftstore/raftstore.go`.  It starts some workers to handle specific tasks asynchronously,  and most of them aren't used now so you can just ignore them. All you need to focus on is `raftWorker`.(kv/raftstore/raft_worker.go)
 
 The whole process is divided into two parts: raft worker polls `raftCh` to get the messages, the messages includes the base tick to drive Raft module and Raft commands to be proposed as Raft entries; it gets and handles ready from Raft module, including send raft messages, persist the state, apply the committed entries to the state machine. Once applied, return the response to clients.
 
@@ -104,7 +104,7 @@ Peer storage is what you interact with through the `Storage` interface in part A
 
 - RaftLocalState: Used to store HardState of the current Raft and the last Log Index.
 - RaftApplyState: Used to store the last Log index that Raft applies and some truncated Log information.
-- RegionLocalState: Used to store Region information and the corresponding Peer state on this Store. Normal indicates that this Peer is normal, Applying means this Peer hasn’t finished the apply snapshot operation and Tombstone shows that this Peer has been removed from Region and cannot join in Raft Group.
+- RegionLocalState: Used to store Region information and the corresponding Peer state on this Store. Normal indicates that this Peer is normal, Applying means this Peer hasn't finished the applied snapshot operation and Tombstone shows that this Peer has been removed from Region and cannot join in Raft Group.
 
 These states are stored in two badger instances: raftdb and kvdb:
 
@@ -122,7 +122,7 @@ The format is as below and some helper functions are provided in `kv/raftstore/m
 
 > You may wonder why TinyKV needs two badger instances. Actually, it can use only one badger to store both raft log and state machine data. Separating into two instances is just to be consistent with TiKV design.
 
-These metadatas should be created and updated in `PeerStorage`. When creating PeerStorage, see `kv/raftstore/peer_storager.go`. It initializes RaftLocalState, RaftApplyState of this Peer or gets the previous value from the underlying engine in the case of restart. Note that the value of both RAFT_INIT_LOG_TERM and RAFT_INIT_LOG_INDEX is 5 (as long as it's larger than 1) but not 0. The reason why not set it to 0 is to distinguish with the case that peer created passively after conf change. You may not quite understand it now, so just keep it in mind and the detail will be described in project3b when you are implementing conf change.
+The metadata should be created and updated in `PeerStorage`. When creating PeerStorage, see `kv/raftstore/peer_storager.go`. It initializes RaftLocalState, RaftApplyState of this Peer or gets the previous value from the underlying engine in the case of restart. Note that the value of both RAFT_INIT_LOG_TERM and RAFT_INIT_LOG_INDEX is 5 (as long as it's larger than 1) but not 0. The reason why not set it to 0 is to distinguish with the case that peer created passively after conf change. You may not quite understand it now, so just keep it in mind and the detail will be described in project3b when you are implementing conf change.
 
 The code you need to implement in this part is only one function:  `PeerStorage.SaveReadyState`, what this function does is to save the data in `raft.Ready` to badger, including append log entries and save the Raft hard state.
 
@@ -168,7 +168,7 @@ for {
 
 After this the whole process of a read or write would be like this:
 
-- Clients calls RPC RawGet/RawPut/RawDelete/RawScan
+- Clients call RPC RawGet/RawPut/RawDelete/RawScan
 - RPC handler calls `RaftStorage` related method
 - `RaftStorage` sends a Raft command request to raftstore, and waits for the response
 - `RaftStore` proposes the Raft command request as a Raft log
@@ -182,20 +182,20 @@ You should run `make project2b` to pass all the tests. The whole test is running
 
 To be noted, error handling is an important part of passing the test. You may have already noticed that there are some errors defined in `proto/proto/errorpb.proto` and the error is a field of the gRPC response. Also, the corresponding errors which implements `error` interface are defined in `kv/raftstore/util/error.go`, so you can use them as a return value of functions.
 
-These error are mainly related with Region. So it is also a member of `RaftResponseHeader` of `RaftCmdResponse`. When proposaling a request or applying a command, there may be some errors. If that, you should return the raft command response with the error, then the error will be further passed to gRPC response. You can use `BindErrResp` provided in `kv/raftstore/cmd_resp.go` to convert these errors to errors defined in `errorpb.proto` when returning the response with error.
+These errors are mainly related with Region. So it is also a member of `RaftResponseHeader` of `RaftCmdResponse`. When proposing a request or applying a command, there may be some errors. If that, you should return the raft command response with the error, then the error will be further passed to gRPC response. You can use `BindErrResp` provided in `kv/raftstore/cmd_resp.go` to convert these errors to errors defined in `errorpb.proto` when returning the response with error.
 
 In this stage, you may consider these errors, and others will be processed in project3:
 
 - ErrNotLeader: the raft command is proposed on a follower. so use it to let client try other peers.
-- ErrStaleCommand: It may due to leader changes that some logs are not committed and overrided with new leaders’ logs. But client doesn’t know that and is still waiting for the response. So you should return this to let client knows and retries the command again.
+- ErrStaleCommand: It may due to leader changes that some logs are not committed and overridden with new leaders’ logs. But client doesn't know that and is still waiting for the response. So you should return this to let client knows and retries the command again.
 
 > Hints:
 >
 > - `PeerStorage` implements the `Storage` interface of  Raft module, you should use the provided method  `SaveRaftReady()` to persist the Raft related states.
 > - Use `WriteBatch` in `engine_util` to make multiple writes atomically, for example, you need to make sure to apply the committed entries and update the applied index in one write batch.
 > - Use `Transport` to send raft messages to other peers, it’s in the `GlobalContext`,
-> - The server should not complete a get RPC if it is not part of a majority and do not has up-to-date data. You can just put the get operation into the raft log, or implement the optimization for read-only operations that is described in Section 8 in the Raft paper.
-> - Do not forget to update and persist the apply state when applying the log entries.
+> - The server should not complete a get RPC if it is not part of a majority and do not have up-to-date data. You can just put the get operation into the raft log, or implement the optimization for read-only operations that is described in Section 8 in the Raft paper.
+> - Do not forget to update and persist the applied state when applying the log entries.
 > - You can apply the committed Raft log entries in an asynchronous way just like TiKV does. It’s not necessary, though a big challenge to improve performance.
 > - Record the callback of the command when proposing, and return the callback after applying.
 > - For the snap command response, should set badger Txn to callback explicitly.
@@ -204,7 +204,7 @@ In this stage, you may consider these errors, and others will be processed in pr
 
 As things stand now with your code, it's not practical for a long-running server to remember the complete Raft log forever. Instead, the server will check the number of Raft log, and discard log entries exceeding the threshold from time to time.
 
-In this part, you will implement the Snapshot handling based on the above two part implementation. Generally, Snapshot is just a raft message like AppendEntries used to replicate data to follower, what make it different is its size, Snapshot contains the whole state machine data in some point of time, and to build and send such a big message at once will consume many resource and time, which may block the handling of other raft message, to amortize this problem, Snapshot message will use an independent connect, and split the data into chunks to transport. That’s the reason why there is a snapshot RPC API for TinyKV service. If you are interested in the detail of sending and receiving, check `snapRunner` and the reference <https://pingcap.com/blog-cn/tikv-source-code-reading-10/>
+In this part, you will implement the Snapshot handling based on the above two part implementation. Generally, Snapshot is just a raft message like AppendEntries used to replicate data to follower, what make it different is its size, Snapshot contains the whole state machine data in some point of time, and to build and send such a big message at once will consume many resources and time, which may block the handling of other raft message, to amortize this problem, Snapshot message will use an independent connect, and split the data into chunks to transport. That’s the reason why there is a snapshot RPC API for TinyKV service. If you are interested in the detail of sending and receiving, check `snapRunner` and the reference <https://pingcap.com/blog-cn/tikv-source-code-reading-10/>
 
 ### The Code
 

@@ -27,10 +27,17 @@ fi
 GO_PREFIX_PATH=github.com/pingcap-incubator/tinykv/proto/pkg
 export PATH=$(pwd)/_tools/bin:$GOPATH/bin:$PATH
 
-echo "install tools..."
-GO111MODULE=off go get github.com/twitchtv/retool
+# I have to install tools by myself,
+# because using retool for me will cause errors
+# go get -u github.com/gogo/protobuf/protoc-gen-gofast
+# go get -u golang.org/x/tools/cmd/goimports
+# The version may cause nothing.
+
+#echo "install tools..."
+#GO111MODULE=off go get github.com/twitchtv/retool
 # Ensure we're using the right versions of our tools (see tools.json).
-GO111MODULE=off retool -base-dir=$(pwd) sync || exit 1
+#GO111MODULE=off retool -base-dir=$(pwd) sync || exit 1
+
 
 function collect() {
     file=$(basename $1)
