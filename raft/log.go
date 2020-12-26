@@ -53,7 +53,9 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
-	//? Add What?
+	//- offset is the upperbound of the compacted logs(snapshot)
+	//- the beginning index of entries
+	offset uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -63,8 +65,26 @@ func newLog(storage Storage) *RaftLog {
 	if storage == nil {
 		log.Panic("storage mustn't be nil")
 	}
-	//? How to init a new logger
-	return &RaftLog{storage: storage}
+	//- This cannot be called here, which may be nil.
+	//- Do this at newRaft().
+	// hardState, _, _ := storage.InitialState()
+	lo, _ := storage.FirstIndex()
+	hi, _ := storage.LastIndex()
+	//- [lo,hi]
+	ents, err := storage.Entries(lo, hi+1)
+	if err != nil {
+		log.Panic(err.Error())
+	}
+	return &RaftLog{
+		storage:   storage,
+		committed: None,
+		applied:   None,
+		offset:    lo,
+		stabled:   hi,
+		entries:   ents,
+		// Used in 2C
+		pendingSnapshot: &pb.Snapshot{},
+	}
 }
 
 // We need to compact the log entries in some point of time like
@@ -77,22 +97,32 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
+	if curLen := len(l.entries); curLen > 0 {
+		return l.entries[l.stabled-l.entries[0].Index+1 : curLen]
+	}
 	return nil
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 {
+		return l.entries[l.applied-l.offset+1 : l.committed-l.offset+1]
+	}
 	return nil
+}
+
+func (l *RaftLog) Entries(lo uint64, hi uint64) []pb.Entry {
+	return l.entries[lo-l.offset+1 : hi-l.offset]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	//! Your Code Here (2A).
-	idx, err := l.storage.LastIndex()
-	if err != nil {
-		panic(err)
+	if curLen := len(l.entries); curLen > 0 {
+		return l.entries[curLen-1].Index
 	}
+	idx, _ := l.storage.LastIndex()
 	return idx
 }
 
@@ -100,7 +130,7 @@ func (l *RaftLog) LastIndex() uint64 {
 func (l *RaftLog) LastTerm() uint64 {
 	term, err := l.Term(l.LastIndex())
 	if err != nil {
-		panic(err)
+		log.Panic(err.Error())
 	}
 	return term
 }
@@ -108,5 +138,16 @@ func (l *RaftLog) LastTerm() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	//! Your Code Here (2A).
+	if i > l.LastIndex() { //- too big
+		return 0, nil
+	}
+	if i >= l.offset { //- the target term in un-compacted entries
+		if len(l.entries) > 0 {
+			curIdx := i - l.offset
+			return l.entries[curIdx].Term, nil
+		} else { //- too big
+			return 0, nil
+		}
+	}
 	return l.storage.Term(i)
 }
