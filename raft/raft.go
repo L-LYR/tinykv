@@ -194,9 +194,14 @@ func newRaft(c *Config) *Raft {
 		RaftLog: rLog,
 		Prs:     prs,
 		//- raft_paper_test.go:76:TestStartAsFollower2AA
-		State:            StateFollower, // start as follower
-		votes:            make(map[uint64]bool),
-		msgs:             make([]pb.Message, 0),
+		State: StateFollower, // start as follower
+		votes: make(map[uint64]bool),
+		//msgs:             make([]pb.Message, 0),
+		//- If here use make() to initialize the msgs, it will cause
+		//- strange errors when using reflect.DeepEqual() to check.
+		//- reflect.DeepEqual() returns false if one slice is nil,
+		//- and the other is a non-nil slice with 0 length.
+		msgs:             nil,
 		Lead:             None,
 		electionTimeout:  c.ElectionTick,
 		heartbeatTimeout: c.HeartbeatTick,
