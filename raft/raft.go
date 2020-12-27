@@ -209,6 +209,21 @@ func newRaft(c *Config) *Raft {
 	}
 }
 
+func (r *Raft) curSoftState() *SoftState {
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+}
+
+func (r *Raft) curHardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
 func (r *Raft) lim() int { return len(r.Prs) / 2 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
