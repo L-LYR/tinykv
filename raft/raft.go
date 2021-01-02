@@ -174,13 +174,8 @@ func newRaft(c *Config) *Raft {
 	//! Your Code Here (2A).
 	//- generate empty peerID -> Progress map from config
 	prs := make(map[uint64]*Progress)
-	lastIdx, _ := c.Storage.LastIndex()
 	for _, p := range c.peers {
-		if p == c.ID {
-			prs[p] = &Progress{Next: lastIdx + 1, Match: lastIdx}
-		} else {
-			prs[p] = &Progress{Next: lastIdx + 1}
-		}
+		prs[p] = &Progress{}
 	}
 	//? When to use confState
 	hardState, _, _ := c.Storage.InitialState()
@@ -214,6 +209,7 @@ func newRaft(c *Config) *Raft {
 	}
 }
 
+// curSoftState returns the current soft state of raft
 func (r *Raft) curSoftState() *SoftState {
 	return &SoftState{
 		Lead:      r.Lead,
@@ -221,6 +217,7 @@ func (r *Raft) curSoftState() *SoftState {
 	}
 }
 
+// curHardState returns the current hard state of raft
 func (r *Raft) curHardState() pb.HardState {
 	return pb.HardState{
 		Term:   r.Term,
@@ -229,19 +226,30 @@ func (r *Raft) curHardState() pb.HardState {
 	}
 }
 
+// lim returns the threshold of winning the election
 func (r *Raft) lim() int { return len(r.Prs) / 2 }
+
+// broadcast does the broadcast for the function like sendAppend and sendHeartbeat
+func (r *Raft) broadcast(fn func(id uint64)) {
+	for p := range r.Prs {
+		fn(p)
+	}
+}
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	//! Your Code Here (2A).
+	if to == r.id {
+		return false
+	}
 	prevIdx := r.Prs[to].Next - 1
 	prevTerm, err := r.RaftLog.Term(prevIdx)
 	if err != nil {
 		log.Panic(err.Error())
 	}
 	entps := make([]*pb.Entry, 0)
-	ents := r.RaftLog.Entries(prevIdx, r.RaftLog.LastIndex()+1)
+	ents := r.RaftLog.Entries(prevIdx+1, r.RaftLog.LastIndex()+1)
 	for i := range ents {
 		entps = append(entps, &ents[i])
 	}
@@ -261,13 +269,12 @@ func (r *Raft) sendAppend(to uint64) bool {
 }
 
 // sendAppendResponse sends a append entries response to the given peer
-func (r *Raft) sendAppendResponse(to uint64, reject bool, logTerm uint64, index uint64) {
+func (r *Raft) sendAppendResponse(to uint64, reject bool, index uint64) {
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
-		LogTerm: logTerm,
 		Index:   index,
 		Reject:  reject,
 	}
@@ -276,6 +283,9 @@ func (r *Raft) sendAppendResponse(to uint64, reject bool, logTerm uint64, index 
 
 // sendVoteRequest sends a vote request to the given peer
 func (r *Raft) sendVoteRequest(to uint64) {
+	if to == r.id {
+		return
+	}
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgRequestVote,
 		To:      to,
@@ -306,6 +316,9 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	//- it will send a MessageType_MsgHeartbeat
 	//- with m.Index = 0, m.LogTerm=0 and empty entries
 	//- as heartbeat to all followers.
+	if to == r.id {
+		return
+	}
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		To:      to,
@@ -394,33 +407,26 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.Vote = None //- haven't voted after becoming follower
 	r.votes = make(map[uint64]bool)
-	//- append a noop entry
+
 	lastIdx := r.RaftLog.LastIndex()
-	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
-		Term:  r.Term,
-		Index: lastIdx + 1,
-		Data:  nil,
-	})
 	//- broadcast noop entry
 	for p := range r.Prs {
-		if p != r.id {
-			r.Prs[p].Next = lastIdx + 1
-			r.sendAppend(p)
-		} else {
-			r.Prs[p].Next = lastIdx + 2
-			r.Prs[p].Match = lastIdx + 1
-		}
+		r.Prs[p].Next = lastIdx + 1
+		r.Prs[p].Match = 0
 	}
-	if len(r.Prs) == 1 {
-		r.RaftLog.committed = r.Prs[r.id].Match
-	}
+	//- broadcast noop entry by proposal
+	r.Step(pb.Message{MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{
+		{Data: nil},
+	}})
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) (err error) {
 	//! Your Code Here (2A).
-	if m.Term > r.Term {
+	if m.Term == 0 {
+		//-	local message
+	} else if m.Term > r.Term {
 		//- test_paper_test.go:52:testUpdateTermFromMessage
 		if m.MsgType == pb.MessageType_MsgHeartbeat ||
 			m.MsgType == pb.MessageType_MsgAppend ||
@@ -429,6 +435,16 @@ func (r *Raft) Step(m pb.Message) (err error) {
 		} else {
 			r.becomeFollower(m.Term, None)
 		}
+	} else if m.Term < r.Term {
+		switch m.MsgType {
+		case pb.MessageType_MsgRequestVote:
+			r.sendVoteResponse(m.From, true)
+		case pb.MessageType_MsgHeartbeat:
+			r.sendHeartbeatResponse(m.From, true)
+		case pb.MessageType_MsgAppend:
+			r.sendAppendResponse(m.From, true, None)
+		}
+		return nil
 	}
 
 	switch r.State {
@@ -450,11 +466,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		//- with m.Index = 0, m.LogTerm=0 and empty entries
 		//- as heartbeat to all followers.
 		//- raft_paper_test.go:87:TestLeaderBcastBeat2AA
-		for pid := range r.Prs {
-			if r.id != pid {
-				r.sendHeartbeat(pid)
-			}
-		}
+		r.broadcast(r.sendHeartbeat)
 	case pb.MessageType_MsgPropose:
 		//- When receiving client proposals,
 		//- the leader appends the proposal to its log as a new entry, then issues
@@ -478,7 +490,6 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.doElection(m)
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
-		r.becomeFollower(m.Term, m.From)
 	case pb.MessageType_MsgRequestVote:
 		r.handleVoteRequest(m)
 	case pb.MessageType_MsgHeartbeat:
@@ -492,18 +503,12 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 	case pb.MessageType_MsgHup:
 		r.doElection(m)
 	case pb.MessageType_MsgAppend:
-		if m.Term == r.Term {
-			r.becomeFollower(m.Term, m.From)
-		}
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleVoteRequest(m)
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.getVote(m.From, m.Reject)
 	case pb.MessageType_MsgHeartbeat:
-		if m.Term == r.Term {
-			r.becomeFollower(m.Term, m.From)
-		}
 		r.handleHeartbeat(m)
 	}
 	return nil
@@ -520,11 +525,7 @@ func (r *Raft) doElection(m pb.Message) {
 		r.becomeLeader()
 		return
 	}
-	for p := range r.Prs {
-		if p != r.id {
-			r.sendVoteRequest(p)
-		}
-	}
+	r.broadcast(r.sendVoteRequest)
 }
 
 // doCommit updates the leader's committed index
@@ -545,11 +546,7 @@ func (r *Raft) doCommit() {
 	// current term are committed by counting replicas.
 	if logTerm == r.Term && midIdx > r.RaftLog.committed {
 		r.RaftLog.committed = midIdx
-		for p := range r.Prs {
-			if p != r.id {
-				r.sendAppend(p)
-			}
-		}
+		r.broadcast(func(id uint64) { r.sendAppend(id) })
 	}
 }
 
@@ -576,11 +573,6 @@ func (r *Raft) getVote(from uint64, reject bool) {
 
 // handleVoteRequest handle vote request
 func (r *Raft) handleVoteRequest(m pb.Message) {
-	//- handle the behind request
-	if m.Term < r.Term {
-		r.sendVoteResponse(m.From, true)
-		return
-	}
 	//- the state of the requester must be beyond the responser.
 	isBeyond := (m.LogTerm > r.RaftLog.LastTerm()) ||
 		(m.LogTerm == r.RaftLog.LastTerm() && m.Index >= r.RaftLog.LastIndex())
@@ -595,21 +587,10 @@ func (r *Raft) handleVoteRequest(m pb.Message) {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	//! Your Code Here (2A).
-	if m.Term < r.Term {
-		//- reject the behind request for appending entries
-		r.sendAppendResponse(m.From, true, None, None)
-		return
-	}
-	lastIdx := r.RaftLog.LastIndex()
-	if m.Index > lastIdx {
-		//- the sender's index is greater than the receiver's lastIndex
-		r.sendAppendResponse(m.From, true, None, lastIdx+1)
-		return
-	}
-	logTerm, err := r.RaftLog.Term(m.Index)
-	if err != nil {
-		log.Panic(err.Error())
-	}
+	r.becomeFollower(m.Term, m.From)
+	//- If ErrUnavailable occurs, logTerm will be zero, which must be different with m.LogTerm.
+	//- So just ignore the ErrUnavailable here.
+	logTerm, _ := r.RaftLog.Term(m.Index)
 	// If the follower does not find an
 	// entry in its log with the same index and term as the one in AppendEntries RPC,
 	// then it refuses the new entries. Otherwise it replies that it accepts the
@@ -617,14 +598,14 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// raft_paper_test.go:571:TestFollowerCheckMessageType_MsgAppend2AB
 	if logTerm != m.LogTerm {
 		//- find the respective index and reject
-		actualIdx := r.RaftLog.offset - 1
-		for i := uint64(0); i < m.Index-r.RaftLog.offset+1; i++ {
-			if r.RaftLog.entries[i].Term == logTerm {
-				actualIdx = i + r.RaftLog.offset
+		idx := min(m.Index, r.RaftLog.LastIndex())
+		for ; idx > r.RaftLog.committed; idx-- {
+			term, err := r.RaftLog.Term(idx)
+			if err != nil || term != logTerm {
 				break
 			}
 		}
-		r.sendAppendResponse(m.From, true, logTerm, actualIdx)
+		r.sendAppendResponse(m.From, true, idx)
 		return
 	}
 	//- append entries in m
@@ -633,28 +614,17 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// and append any new entries not already in the log.
 	// Also, it writes the new entry into stable storage.
 	// raft_paper_test.go:617:TestFollowerAppendEntries2AB
-	for i, entry := range m.Entries {
-		if entry.Index > r.RaftLog.LastIndex() {
-			//- append all new entries
-			for ; i < len(m.Entries); i++ {
-				r.RaftLog.entries = append(r.RaftLog.entries, *m.Entries[i])
+	if len(r.RaftLog.entries) == 0 {
+		r.RaftLog.append(m.Entries)
+	} else {
+		for i, entry := range m.Entries {
+			term, err := r.RaftLog.Term(entry.Index)
+			if err != nil || term != entry.Term {
+				r.RaftLog.stabled = min(r.RaftLog.stabled, entry.Index-1)
+				r.RaftLog.entries = r.RaftLog.entries[:r.RaftLog.toSliceIndex(entry.Index-1)+1]
+				r.RaftLog.append(m.Entries[i:])
+				break
 			}
-			break
-		} else {
-			logTerm, err := r.RaftLog.Term(entry.Index)
-			if err != nil {
-				log.Panic(err.Error())
-			}
-			if logTerm != entry.Term {
-				//- resolve conflict
-				idx := entry.Index - r.RaftLog.offset
-				r.RaftLog.entries[idx] = *entry
-				r.RaftLog.entries = r.RaftLog.entries[:idx+1]
-				if r.RaftLog.stabled >= entry.Index {
-					r.RaftLog.stabled = entry.Index - 1
-				}
-			}
-			//- just the same, so do nothing
 		}
 	}
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
@@ -662,37 +632,21 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		//r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
 		r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
 	}
-	r.sendAppendResponse(m.From, false, None, r.RaftLog.LastIndex())
+	r.sendAppendResponse(m.From, false, r.RaftLog.LastIndex())
 }
 
 func (r *Raft) handleAppendResponse(m pb.Message) {
-	if m.Term < r.Term {
-		//- do nothing for behind response
-		return
-	}
-
 	if m.Reject {
 		//- non-leader node refused to append
 		// leader could bring a follower's log
 		// into consistency with its own.
-		actualIdx := -1
-		for i := 0; i < len(r.RaftLog.entries); i++ {
-			if r.RaftLog.entries[i].Term > m.LogTerm {
-				actualIdx = i
-				break
-			}
-		}
-		if actualIdx > 0 && r.RaftLog.entries[actualIdx-1].Term == m.LogTerm {
-			r.Prs[m.From].Next = uint64(actualIdx) + r.RaftLog.offset
-		} else {
-			r.Prs[m.From].Next = m.Index
-		}
+		r.Prs[m.From].Next = m.Index + 1
 		r.sendAppend(m.From)
 		return
 	}
 
-	r.Prs[m.From].Match = m.Index
 	r.Prs[m.From].Next = m.Index + 1
+	r.Prs[m.From].Match = m.Index
 	// leader commit
 	r.doCommit()
 }
@@ -707,25 +661,14 @@ func (r *Raft) handleProposal(m pb.Message) {
 	lastIdx = r.RaftLog.LastIndex()
 	r.Prs[r.id].Match = lastIdx
 	r.Prs[r.id].Next = lastIdx + 1
-	for p := range r.Prs {
-		if p != r.id {
-			r.sendAppend(p)
-		}
-	}
-	//- If there is only one node, just commit this entry.
-	if len(r.Prs) == 1 {
-		r.RaftLog.committed = lastIdx
-	}
+	r.broadcast(func(id uint64) { r.sendAppend(id) })
+	r.doCommit()
 }
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	//! Your Code Here (2A).
 	//- handle the behind heartbeat
-	if m.Term < r.Term {
-		r.sendHeartbeatResponse(m.From, true)
-		return
-	}
 	r.RaftLog.committed = m.Commit
 	r.sendHeartbeatResponse(m.From, false)
 	r.becomeFollower(m.Term, m.From)

@@ -53,9 +53,6 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
-	//- offset is the upperbound of the compacted logs(snapshot)
-	//- the beginning index of entries
-	offset uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -77,9 +74,8 @@ func newLog(storage Storage) *RaftLog {
 	}
 	return &RaftLog{
 		storage:   storage,
-		committed: None,
-		applied:   None,
-		offset:    lo,
+		committed: lo - 1,
+		applied:   lo - 1,
 		stabled:   hi,
 		entries:   ents,
 		// Used in 2C
@@ -98,7 +94,7 @@ func (l *RaftLog) maybeCompact() {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	//! Your Code Here (2A).
 	if curLen := len(l.entries); curLen > 0 {
-		return l.entries[l.stabled-l.entries[0].Index+1:]
+		return l.Entries(l.stabled+1, l.LastIndex()+1)
 	}
 	return nil
 }
@@ -107,13 +103,17 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	//! Your Code Here (2A).
 	if len(l.entries) > 0 && l.applied < l.committed {
-		return l.entries[l.applied-l.offset+1 : l.committed-l.offset+1]
+		return l.Entries(l.applied+1, l.committed+1)
 	}
 	return nil
 }
 
+// Entries returns entries from lo to hi, namely [lo, hi).
+// NOTE: inputs are indexes of entries
 func (l *RaftLog) Entries(lo uint64, hi uint64) []pb.Entry {
-	return l.entries[lo-l.offset+1 : hi-l.offset]
+	lo = l.toSliceIndex(lo)
+	hi = l.toSliceIndex(hi)
+	return l.entries[lo:hi]
 }
 
 // LastIndex return the last index of the log entries
@@ -123,6 +123,15 @@ func (l *RaftLog) LastIndex() uint64 {
 		return l.entries[curLen-1].Index
 	}
 	idx, _ := l.storage.LastIndex()
+	return idx
+}
+
+// FirstIndex return the first index of the log entries
+func (l *RaftLog) FirstIndex() uint64 {
+	if len(l.entries) > 0 {
+		return l.entries[0].Index
+	}
+	idx, _ := l.storage.FirstIndex()
 	return idx
 }
 
@@ -138,16 +147,28 @@ func (l *RaftLog) LastTerm() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	//! Your Code Here (2A).
-	if i > l.LastIndex() { //- too big
+	if i > l.LastIndex() {
 		return 0, ErrUnavailable
 	}
-	if i >= l.offset { //- the target term in un-compacted entries
-		if len(l.entries) > 0 {
-			curIdx := i - l.offset
-			return l.entries[curIdx].Term, nil
-		} else { //- too big
-			return 0, ErrUnavailable
-		}
+	if i >= l.FirstIndex() && len(l.entries) > 0 {
+		return l.entries[l.toSliceIndex(i)].Term, nil
 	}
 	return l.storage.Term(i)
+}
+
+// append new entries behind the raftlog's entries
+func (l *RaftLog) append(ents []*pb.Entry) {
+	for _, ent := range ents {
+		l.entries = append(l.entries, *ent)
+	}
+}
+
+// toSliceIndex
+func (l *RaftLog) toSliceIndex(entryIndex uint64) uint64 {
+	return entryIndex - l.FirstIndex()
+}
+
+// toEntryIndex
+func (l *RaftLog) toEntryIndex(sliceIndex uint64) uint64 {
+	return sliceIndex + l.FirstIndex()
 }
