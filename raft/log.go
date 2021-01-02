@@ -16,7 +16,6 @@ package raft
 
 import (
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
-	"github.com/pingcap/log"
 )
 
 // RaftLog manage the log entries, its struct look like:
@@ -60,7 +59,7 @@ type RaftLog struct {
 func newLog(storage Storage) *RaftLog {
 	//! Your Code Here (2A).
 	if storage == nil {
-		log.Panic("storage mustn't be nil")
+		panic("storage mustn't be nil")
 	}
 	//- This cannot be called here, which may be nil.
 	//- Do this at newRaft().
@@ -70,7 +69,7 @@ func newLog(storage Storage) *RaftLog {
 	//- [lo,hi]
 	ents, err := storage.Entries(lo, hi+1)
 	if err != nil {
-		log.Panic(err.Error())
+		panic(err)
 	}
 	return &RaftLog{
 		storage:   storage,
@@ -139,7 +138,7 @@ func (l *RaftLog) FirstIndex() uint64 {
 func (l *RaftLog) LastTerm() uint64 {
 	term, err := l.Term(l.LastIndex())
 	if err != nil {
-		log.Panic(err.Error())
+		panic(err)
 	}
 	return term
 }

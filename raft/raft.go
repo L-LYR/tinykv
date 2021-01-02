@@ -19,8 +19,6 @@ import (
 	"math/rand"
 	"sort"
 
-	"github.com/pingcap/log"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -169,18 +167,24 @@ type Raft struct {
 // newRaft return a raft peer with the given config
 func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
-		panic(err.Error())
+		panic(err)
 	}
 	//! Your Code Here (2A).
-	//- generate empty peerID -> Progress map from config
-	prs := make(map[uint64]*Progress)
-	for _, p := range c.peers {
-		prs[p] = &Progress{}
-	}
-	//? When to use confState
-	hardState, _, _ := c.Storage.InitialState()
+	//- ConfState used in 2B
+	hardState, confState, _ := c.Storage.InitialState()
 	rLog := newLog(c.Storage)
 	rLog.committed = hardState.Commit
+
+	peers := confState.Nodes
+	if len(c.peers) != 0 {
+		peers = c.peers
+	}
+
+	prs := make(map[uint64]*Progress)
+	//- generate empty peerID -> Progress map from config
+	for _, p := range peers {
+		prs[p] = &Progress{}
+	}
 	//- init a new raft peer
 	return &Raft{
 		id:      c.ID,
@@ -246,7 +250,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevIdx := r.Prs[to].Next - 1
 	prevTerm, err := r.RaftLog.Term(prevIdx)
 	if err != nil {
-		log.Panic(err.Error())
+		panic(err)
 	}
 	entps := make([]*pb.Entry, 0)
 	ents := r.RaftLog.Entries(prevIdx+1, r.RaftLog.LastIndex()+1)
@@ -537,16 +541,18 @@ func (r *Raft) doCommit() {
 	}
 	sort.Sort(curMatches)
 	mid := (len(r.Prs) - 1) / 2
-	midIdx := curMatches[mid]
-	logTerm, err := r.RaftLog.Term(midIdx)
-	if err != nil {
-		log.Panic(err.Error())
-	}
+	idx := curMatches[mid]
 	// only log entries from the leader’s
 	// current term are committed by counting replicas.
-	if logTerm == r.Term && midIdx > r.RaftLog.committed {
-		r.RaftLog.committed = midIdx
-		r.broadcast(func(id uint64) { r.sendAppend(id) })
+	if idx > r.RaftLog.committed {
+		logTerm, err := r.RaftLog.Term(idx)
+		if err != nil {
+			panic(err)
+		}
+		if logTerm == r.Term {
+			r.RaftLog.committed = idx
+			r.broadcast(func(id uint64) { r.sendAppend(id) })
+		}
 	}
 }
 
