@@ -174,7 +174,13 @@ func newRaft(c *Config) *Raft {
 	hardState, confState, _ := c.Storage.InitialState()
 	rLog := newLog(c.Storage)
 	rLog.committed = hardState.Commit
-
+	if c.Applied > 0 {
+		//- Applied is the last applied index. It should only be set when restarting
+		//- raft. raft will not return entries to the application smaller or equal to
+		//- Applied. If Applied is unset when restarting, raft might return previous
+		//- applied entries. This is a very application dependent configuration.
+		rLog.applied = c.Applied
+	}
 	peers := confState.Nodes
 	if len(c.peers) != 0 {
 		peers = c.peers
@@ -250,6 +256,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevIdx := r.Prs[to].Next - 1
 	prevTerm, err := r.RaftLog.Term(prevIdx)
 	if err != nil {
+		if err == ErrCompacted {
+			//- send snapshot to slow node
+			return r.sendSnapShot(to)
+		}
 		panic(err)
 	}
 	entps := make([]*pb.Entry, 0)
@@ -311,6 +321,29 @@ func (r *Raft) sendVoteResponse(to uint64, reject bool) {
 		Reject:  reject,
 	}
 	r.msgs = append(r.msgs, m)
+}
+
+// sendSnapShot sends a snapshot
+func (r *Raft) sendSnapShot(to uint64) bool {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		if err == ErrSnapshotTemporarilyUnavailable {
+			return false
+		}
+		panic(err)
+	}
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	}
+	r.msgs = append(r.msgs, msg)
+	if !IsEmptySnap(&snapshot) {
+		r.Prs[to].Next = snapshot.Metadata.Index + 1
+	}
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -447,6 +480,8 @@ func (r *Raft) Step(m pb.Message) (err error) {
 			r.sendHeartbeatResponse(m.From, true)
 		case pb.MessageType_MsgAppend:
 			r.sendAppendResponse(m.From, true, None)
+		case pb.MessageType_MsgSnapshot:
+			r.sendAppendResponse(m.From, true, None)
 		}
 		return nil
 	}
@@ -496,6 +531,8 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleVoteRequest(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
 	}
@@ -512,6 +549,8 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		r.handleVoteRequest(m)
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.getVote(m.From, m.Reject)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
 	}
@@ -674,7 +713,6 @@ func (r *Raft) handleProposal(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	//! Your Code Here (2A).
-	//- handle the behind heartbeat
 	r.RaftLog.committed = m.Commit
 	r.sendHeartbeatResponse(m.From, false)
 	r.becomeFollower(m.Term, m.From)
@@ -682,7 +720,28 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
-	// Your Code Here (2C).
+	//! Your Code Here (2C).
+	s := m.Snapshot
+	if s == nil {
+		return
+	}
+
+	//- reference from etcd
+	if s.Metadata.Index < r.RaftLog.committed {
+		r.sendAppendResponse(m.From, true, r.RaftLog.committed)
+		return
+	}
+
+	r.RaftLog.restore(s)
+	//- update ConfState
+	newPrs := make(map[uint64]*Progress)
+	//- generate empty peerID -> Progress map from config
+	for _, p := range s.Metadata.ConfState.Nodes {
+		newPrs[p] = &Progress{}
+	}
+	r.Prs = newPrs
+	r.becomeFollower(m.Term, m.From)
+	r.sendAppendResponse(m.From, true, r.RaftLog.LastIndex())
 }
 
 // addNode add a new node to raft group
