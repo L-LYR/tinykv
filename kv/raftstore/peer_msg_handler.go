@@ -4,6 +4,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
+
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
@@ -42,7 +48,136 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
-	// Your Code Here (2B).
+	//! Your Code Here (2B).
+	//- pseudocode
+	//- for {
+	//-  select {
+	//-  case <-s.Ticker:
+	//-    Node.Tick()
+	//-  default:
+	//-    if Node.HasReady() {
+	//-      rd := Node.Ready()
+	//-      saveToStorage(rd.State, rd.Entries, rd.Snapshot)
+	//-      send(rd.Messages)
+	//-      for _, entry := range rd.CommittedEntries {
+	//-        process(entry)
+	//-      }
+	//-      s.Node.Advance(rd)
+	//-    }
+	//-}
+	if d.RaftGroup.HasReady() {
+		rd := d.RaftGroup.Ready()
+
+		_, err := d.peerStorage.SaveReadyState(&rd)
+		if err != nil {
+			panic(err)
+		}
+
+		if len(rd.Messages) > 0 {
+			d.Send(d.ctx.trans, rd.Messages)
+		}
+
+		if len(rd.CommittedEntries) > 0 {
+			d.handleCommittedEntries(rd.CommittedEntries)
+		}
+
+		d.RaftGroup.Advance(rd)
+	}
+}
+
+func (d *peerMsgHandler) handleCommittedEntries(entries []pb.Entry) {
+	kvWB := new(engine_util.WriteBatch)
+	//- Record the callback of the command when proposing,
+	//- and return the callback after applying.
+	for _, ent := range entries {
+		err := d.apply(&ent, kvWB)
+		if err != nil {
+			panic(err)
+		}
+	}
+	d.doCurrentWB(&entries[len(entries)-1], kvWB)
+}
+
+func (d *peerMsgHandler) apply(entry *pb.Entry, kvWB *engine_util.WriteBatch) error {
+	if entry.Data == nil {
+		return nil
+	}
+
+	request := &raft_cmdpb.RaftCmdRequest{}
+	err := request.Unmarshal(entry.Data)
+	if err != nil {
+		return err
+	}
+	//- ignore admin cmd
+	if len(request.GetRequests()) > 0 {
+		for _, req := range request.GetRequests() {
+			switch req.GetCmdType() {
+			case raft_cmdpb.CmdType_Put:
+				putReq := req.GetPut()
+				kvWB.SetCF(putReq.GetCf(), putReq.GetKey(), putReq.GetValue())
+			case raft_cmdpb.CmdType_Delete:
+				deleteReq := req.GetDelete()
+				kvWB.DeleteCF(deleteReq.GetCf(), deleteReq.GetKey())
+			}
+			kvWB = d.response(entry, req, kvWB)
+		}
+	}
+	return nil
+}
+
+func (d *peerMsgHandler) response(entry *pb.Entry, request *raft_cmdpb.Request, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
+	if len(d.proposals) == 0 {
+		return kvWB
+	}
+	p := d.proposals[0]
+	if p.index == entry.Index && p.term == entry.Term {
+		cb := p.cb
+		resp := &raft_cmdpb.Response{
+			CmdType: request.GetCmdType(),
+		}
+		switch request.GetCmdType() {
+		case raft_cmdpb.CmdType_Get:
+			d.doCurrentWB(entry, kvWB)
+			getReq := request.GetGet()
+			val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, getReq.GetCf(), getReq.GetKey())
+			resp.Get = &raft_cmdpb.GetResponse{Value: val}
+			kvWB = new(engine_util.WriteBatch)
+		case raft_cmdpb.CmdType_Snap:
+			d.doCurrentWB(entry, kvWB)
+			cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+			resp.Snap = &raft_cmdpb.SnapResponse{Region: d.Region()}
+			kvWB = new(engine_util.WriteBatch)
+		case raft_cmdpb.CmdType_Put:
+			resp.Put = &raft_cmdpb.PutResponse{}
+		case raft_cmdpb.CmdType_Delete:
+			resp.Delete = &raft_cmdpb.DeleteResponse{}
+		}
+		cb.Done(&raft_cmdpb.RaftCmdResponse{
+			//- see newCmdResp()
+			Header:    &raft_cmdpb.RaftResponseHeader{},
+			Responses: []*raft_cmdpb.Response{resp},
+		})
+	} else {
+		NotifyStaleReq(p.term, p.cb)
+	}
+	//- ErrStaleCommand: It may due to leader changes that some logs are not committed and overridden
+	//- with new leaders’ logs. But client doesn't know that and is still waiting for the response.
+	//- So you should return this to let client knows and retries the command again.
+	d.proposals = d.proposals[1:]
+	return kvWB
+}
+
+func (d *peerMsgHandler) doCurrentWB(entry *pb.Entry, wb *engine_util.WriteBatch) {
+	d.peerStorage.applyState.AppliedIndex = entry.Index
+	err := wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+	if err != nil {
+		panic(err)
+	}
+	err = wb.WriteToDB(d.peerStorage.Engines.Kv)
+	if err != nil {
+		panic(err)
+	}
+	//wb.Reset()
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -113,7 +248,39 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
-	// Your Code Here (2B).
+	//! Your Code Here (2B).
+	if len(msg.Requests) > 0 {
+		d.proposeRequests(msg, cb)
+	}
+}
+
+func (d *peerMsgHandler) proposeRequests(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	data, err := msg.Marshal()
+	if err != nil {
+		panic(err)
+	}
+
+	nextIdx := d.nextProposalIndex()
+	//- ErrStaleCommand: It may due to leader changes that some logs are not committed and overridden
+	//- with new leaders’ logs. But client doesn't know that and is still waiting for the response.
+	//- So you should return this to let client knows and retries the command again.
+	if len(d.proposals) > 0 {
+		i := len(d.proposals) - 1
+		for ; i >= 0 && d.proposals[i].index >= nextIdx; i-- {
+			NotifyStaleReq(d.proposals[i].term, cb)
+		}
+		d.proposals = d.proposals[:i]
+	}
+	err = d.RaftGroup.Propose(data)
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+	d.peer.proposals = append(d.peer.proposals, &proposal{
+		index: nextIdx,
+		term:  d.Term(),
+		cb:    cb,
+	})
 }
 
 func (d *peerMsgHandler) onTick() {
