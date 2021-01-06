@@ -106,9 +106,15 @@ func (d *peerMsgHandler) apply(entry *pb.Entry, kvWB *engine_util.WriteBatch) er
 	request := &raft_cmdpb.RaftCmdRequest{}
 	err := request.Unmarshal(entry.Data)
 	if err != nil {
-		return err
+		adminRequest := &raft_cmdpb.AdminRequest{}
+		err = adminRequest.Unmarshal(entry.Data)
+		if err != nil {
+			return err
+		}
+		//- handle admin cmd
+		d.handleAdminRequest(adminRequest, kvWB)
+		return nil
 	}
-	//- ignore admin cmd
 	if len(request.GetRequests()) > 0 {
 		for _, req := range request.GetRequests() {
 			switch req.GetCmdType() {
@@ -119,15 +125,39 @@ func (d *peerMsgHandler) apply(entry *pb.Entry, kvWB *engine_util.WriteBatch) er
 				deleteReq := req.GetDelete()
 				kvWB.DeleteCF(deleteReq.GetCf(), deleteReq.GetKey())
 			}
-			kvWB = d.response(entry, req, kvWB)
+			d.response(entry, req, kvWB)
 		}
 	}
 	return nil
 }
 
-func (d *peerMsgHandler) response(entry *pb.Entry, request *raft_cmdpb.Request, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
+func (d *peerMsgHandler) handleAdminRequest(admin *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch) {
+	switch admin.GetCmdType() {
+	case raft_cmdpb.AdminCmdType_InvalidAdmin:
+	case raft_cmdpb.AdminCmdType_ChangePeer:
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		compactLog := admin.GetCompactLog()
+		applyState := d.peerStorage.applyState
+		if d.peerStorage.truncatedIndex() <= compactLog.CompactIndex {
+			//- update
+			applyState.TruncatedState.Index = compactLog.CompactIndex
+			applyState.TruncatedState.Term = compactLog.CompactTerm
+
+			err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), applyState)
+			if err != nil {
+				return
+			}
+			//? ScheduleCompactLog will not use the firstIndex, Why?
+			d.ScheduleCompactLog(0, applyState.TruncatedState.Index)
+		}
+	case raft_cmdpb.AdminCmdType_TransferLeader:
+	case raft_cmdpb.AdminCmdType_Split:
+	}
+}
+
+func (d *peerMsgHandler) response(entry *pb.Entry, request *raft_cmdpb.Request, kvWB *engine_util.WriteBatch) {
 	if len(d.proposals) == 0 {
-		return kvWB
+		return
 	}
 	p := d.proposals[0]
 	if p.index == entry.Index && p.term == entry.Term {
@@ -141,12 +171,12 @@ func (d *peerMsgHandler) response(entry *pb.Entry, request *raft_cmdpb.Request, 
 			getReq := request.GetGet()
 			val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, getReq.GetCf(), getReq.GetKey())
 			resp.Get = &raft_cmdpb.GetResponse{Value: val}
-			kvWB = new(engine_util.WriteBatch)
+			kvWB.Reset()
 		case raft_cmdpb.CmdType_Snap:
 			d.doCurrentWB(entry, kvWB)
 			cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 			resp.Snap = &raft_cmdpb.SnapResponse{Region: d.Region()}
-			kvWB = new(engine_util.WriteBatch)
+			kvWB.Reset()
 		case raft_cmdpb.CmdType_Put:
 			resp.Put = &raft_cmdpb.PutResponse{}
 		case raft_cmdpb.CmdType_Delete:
@@ -160,11 +190,7 @@ func (d *peerMsgHandler) response(entry *pb.Entry, request *raft_cmdpb.Request, 
 	} else {
 		NotifyStaleReq(p.term, p.cb)
 	}
-	//- ErrStaleCommand: It may due to leader changes that some logs are not committed and overridden
-	//- with new leaders’ logs. But client doesn't know that and is still waiting for the response.
-	//- So you should return this to let client knows and retries the command again.
 	d.proposals = d.proposals[1:]
-	return kvWB
 }
 
 func (d *peerMsgHandler) doCurrentWB(entry *pb.Entry, wb *engine_util.WriteBatch) {
@@ -249,8 +275,23 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	//! Your Code Here (2B).
-	if len(msg.Requests) > 0 {
+	if msg.AdminRequest != nil {
+		//- In 2C, admin request's callback will be nil
+		//- only for raft_cmdpb.AdminCmdType_CompactLog, see onRaftGCLogTick()
+		d.proposeAdminRequest(msg.AdminRequest)
+	} else if len(msg.Requests) > 0 {
 		d.proposeRequests(msg, cb)
+	}
+}
+
+func (d *peerMsgHandler) proposeAdminRequest(admin *raft_cmdpb.AdminRequest) {
+	data, err := admin.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	err = d.RaftGroup.Propose(data)
+	if err != nil {
+		return
 	}
 }
 
@@ -269,7 +310,12 @@ func (d *peerMsgHandler) proposeRequests(msg *raft_cmdpb.RaftCmdRequest, cb *mes
 		for ; i >= 0 && d.proposals[i].index >= nextIdx; i-- {
 			NotifyStaleReq(d.proposals[i].term, cb)
 		}
-		d.proposals = d.proposals[:i]
+		//- warning: i may be -1
+		if i <= 0 {
+			d.proposals = make([]*proposal, 0)
+		} else {
+			d.proposals = d.proposals[:i]
+		}
 	}
 	err = d.RaftGroup.Propose(data)
 	if err != nil {
