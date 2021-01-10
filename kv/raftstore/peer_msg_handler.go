@@ -106,16 +106,12 @@ func (d *peerMsgHandler) apply(entry *pb.Entry, kvWB *engine_util.WriteBatch) er
 	request := &raft_cmdpb.RaftCmdRequest{}
 	err := request.Unmarshal(entry.Data)
 	if err != nil {
-		adminRequest := &raft_cmdpb.AdminRequest{}
-		err = adminRequest.Unmarshal(entry.Data)
-		if err != nil {
-			return err
-		}
-		//- handle admin cmd
-		d.handleAdminRequest(adminRequest, kvWB)
-		return nil
+		return err
 	}
-	if len(request.GetRequests()) > 0 {
+
+	if request.AdminRequest != nil {
+		d.handleAdminRequest(request.AdminRequest, kvWB)
+	} else if len(request.GetRequests()) > 0 {
 		for _, req := range request.GetRequests() {
 			switch req.GetCmdType() {
 			case raft_cmdpb.CmdType_Put:
@@ -145,7 +141,7 @@ func (d *peerMsgHandler) handleAdminRequest(admin *raft_cmdpb.AdminRequest, kvWB
 
 			err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), applyState)
 			if err != nil {
-				return
+				panic(err)
 			}
 			//? ScheduleCompactLog will not use the firstIndex, Why?
 			d.ScheduleCompactLog(0, applyState.TruncatedState.Index)
@@ -203,7 +199,6 @@ func (d *peerMsgHandler) doCurrentWB(entry *pb.Entry, wb *engine_util.WriteBatch
 	if err != nil {
 		panic(err)
 	}
-	//wb.Reset()
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -278,20 +273,20 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	if msg.AdminRequest != nil {
 		//- In 2C, admin request's callback will be nil
 		//- only for raft_cmdpb.AdminCmdType_CompactLog, see onRaftGCLogTick()
-		d.proposeAdminRequest(msg.AdminRequest)
+		d.proposeAdminRequest(msg)
 	} else if len(msg.Requests) > 0 {
 		d.proposeRequests(msg, cb)
 	}
 }
 
-func (d *peerMsgHandler) proposeAdminRequest(admin *raft_cmdpb.AdminRequest) {
-	data, err := admin.Marshal()
+func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest) {
+	data, err := msg.Marshal()
 	if err != nil {
 		panic(err)
 	}
 	err = d.RaftGroup.Propose(data)
 	if err != nil {
-		return
+		panic(err)
 	}
 }
 
