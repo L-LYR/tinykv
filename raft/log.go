@@ -137,6 +137,17 @@ func (l *RaftLog) Entries(lo uint64, hi uint64) []pb.Entry {
 	return l.entries[lo:]
 }
 
+func (l *RaftLog) getEntries(lo uint64) ([]pb.Entry, error) {
+	if lo < l.FirstIndex() {
+		return nil, ErrUnavailable
+	}
+	lastIndex := l.LastIndex()
+	if lo > lastIndex || lastIndex == 0 {
+		return nil, nil
+	}
+	return l.entries[l.toSliceIndex(lo):], nil
+}
+
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	//! Your Code Here (2A).

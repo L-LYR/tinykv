@@ -261,16 +261,12 @@ func (r *Raft) sendAppend(to uint64) bool {
 		return false
 	}
 	prevIdx := r.Prs[to].Next - 1
-	prevTerm, err := r.RaftLog.Term(prevIdx)
-	if err != nil {
-		if err == ErrCompacted {
-			//- send snapshot to slow node
-			return r.sendSnapShot(to)
-		}
-		panic(err)
+	prevTerm, errTerm := r.RaftLog.Term(prevIdx)
+	ents, errEnts := r.RaftLog.getEntries(r.Prs[to].Next)
+	if errEnts != nil || errTerm != nil {
+		return r.sendSnapShot(to)
 	}
 	entps := make([]*pb.Entry, 0)
-	ents := r.RaftLog.Entries(prevIdx+1, r.RaftLog.LastIndex()+1)
 	for i := range ents {
 		entps = append(entps, &ents[i])
 	}
@@ -526,6 +522,9 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		//- raft_paper_test.go:87:TestLeaderBcastBeat2AA
 		r.broadcast(r.sendHeartbeat)
 	case pb.MessageType_MsgPropose:
+		if r.leadTransferee != None {
+			return ErrProposalDropped
+		}
 		//- When receiving client proposals,
 		//- the leader appends the proposal to its log as a new entry, then issues
 		//- AppendEntries RPCs in parallel to each of the other servers to replicate
@@ -548,6 +547,8 @@ func (r *Raft) stepFollower(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		r.doElection(m)
+	case pb.MessageType_MsgPropose:
+		return ErrProposalDropped
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgRequestVote:
@@ -568,6 +569,8 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		r.doElection(m)
+	case pb.MessageType_MsgPropose:
+		return ErrProposalDropped
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgRequestVote:
@@ -729,9 +732,6 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 }
 
 func (r *Raft) handleProposal(m pb.Message) {
-	if r.leadTransferee != None {
-		return
-	}
 	lastIdx := r.RaftLog.LastIndex()
 	for i, entry := range m.Entries {
 		entry.Term = r.Term
@@ -756,14 +756,15 @@ func (r *Raft) handleProposal(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	//! Your Code Here (2A).
+	r.becomeFollower(m.Term, m.From)
 	r.RaftLog.committed = m.Commit
 	r.sendHeartbeatResponse(m.From, false)
-	r.becomeFollower(m.Term, m.From)
 }
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	//! Your Code Here (2C).
+	r.becomeFollower(m.Term, m.From)
 	s := m.Snapshot
 	if s == nil {
 		return
@@ -783,7 +784,6 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		newPrs[p] = &Progress{}
 	}
 	r.Prs = newPrs
-	r.becomeFollower(m.Term, m.From)
 	r.sendAppendResponse(m.From, true, r.RaftLog.LastIndex())
 }
 
@@ -834,7 +834,7 @@ func (r *Raft) removeNode(id uint64) {
 		return
 	}
 	delete(r.Prs, id)
-	if id != r.id {
+	if id != r.id && r.State == StateLeader {
 		r.doCommit()
 	}
 }
