@@ -65,24 +65,36 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	//-      s.Node.Advance(rd)
 	//-    }
 	//-}
-	if d.RaftGroup.HasReady() {
-		rd := d.RaftGroup.Ready()
-
-		_, err := d.peerStorage.SaveReadyState(&rd)
-		if err != nil {
-			panic(err)
-		}
-
-		if len(rd.Messages) > 0 {
-			d.Send(d.ctx.trans, rd.Messages)
-		}
-
-		if len(rd.CommittedEntries) > 0 {
-			d.handleCommittedEntries(rd.CommittedEntries)
-		}
-
-		d.RaftGroup.Advance(rd)
+	if !d.RaftGroup.HasReady() {
+		return
 	}
+	rd := d.RaftGroup.Ready()
+
+	res, err := d.peerStorage.SaveReadyState(&rd)
+	if err != nil {
+		panic(err)
+	}
+	if res != nil {
+		pReg := res.PrevRegion // previous region
+		cReg := res.Region     // current region
+		sMeta := d.ctx.storeMeta
+		if len(pReg.Peers) > 0 {
+			sMeta.regionRanges.Delete(&regionItem{region: pReg})
+		}
+		sMeta.regionRanges.ReplaceOrInsert(&regionItem{region: cReg})
+		sMeta.regions[cReg.Id] = cReg
+
+	}
+
+	if len(rd.Messages) > 0 {
+		d.Send(d.ctx.trans, rd.Messages)
+	}
+
+	if len(rd.CommittedEntries) > 0 {
+		d.handleCommittedEntries(rd.CommittedEntries)
+	}
+
+	d.RaftGroup.Advance(rd)
 }
 
 func (d *peerMsgHandler) handleCommittedEntries(entries []pb.Entry) {
@@ -144,7 +156,7 @@ func (d *peerMsgHandler) handleAdminRequest(admin *raft_cmdpb.AdminRequest, kvWB
 				panic(err)
 			}
 			//? ScheduleCompactLog will not use the firstIndex, Why?
-			d.ScheduleCompactLog(0, applyState.TruncatedState.Index)
+			d.ScheduleCompactLog(0, compactLog.CompactIndex)
 		}
 	case raft_cmdpb.AdminCmdType_TransferLeader:
 	case raft_cmdpb.AdminCmdType_Split:
@@ -167,12 +179,10 @@ func (d *peerMsgHandler) response(entry *pb.Entry, request *raft_cmdpb.Request, 
 			getReq := request.GetGet()
 			val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, getReq.GetCf(), getReq.GetKey())
 			resp.Get = &raft_cmdpb.GetResponse{Value: val}
-			kvWB.Reset()
 		case raft_cmdpb.CmdType_Snap:
 			d.doCurrentWB(entry, kvWB)
 			cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 			resp.Snap = &raft_cmdpb.SnapResponse{Region: d.Region()}
-			kvWB.Reset()
 		case raft_cmdpb.CmdType_Put:
 			resp.Put = &raft_cmdpb.PutResponse{}
 		case raft_cmdpb.CmdType_Delete:
@@ -199,6 +209,7 @@ func (d *peerMsgHandler) doCurrentWB(entry *pb.Entry, wb *engine_util.WriteBatch
 	if err != nil {
 		panic(err)
 	}
+	wb.Reset()
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -295,23 +306,7 @@ func (d *peerMsgHandler) proposeRequests(msg *raft_cmdpb.RaftCmdRequest, cb *mes
 	if err != nil {
 		panic(err)
 	}
-
 	nextIdx := d.nextProposalIndex()
-	//- ErrStaleCommand: It may due to leader changes that some logs are not committed and overridden
-	//- with new leaders’ logs. But client doesn't know that and is still waiting for the response.
-	//- So you should return this to let client knows and retries the command again.
-	if len(d.proposals) > 0 {
-		i := len(d.proposals) - 1
-		for ; i >= 0 && d.proposals[i].index >= nextIdx; i-- {
-			NotifyStaleReq(d.proposals[i].term, cb)
-		}
-		//- warning: i may be -1
-		if i <= 0 {
-			d.proposals = make([]*proposal, 0)
-		} else {
-			d.proposals = d.proposals[:i]
-		}
-	}
 	err = d.RaftGroup.Propose(data)
 	if err != nil {
 		cb.Done(ErrResp(err))

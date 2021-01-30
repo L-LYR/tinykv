@@ -54,9 +54,13 @@ func NewCluster(count int, schedulerClient *MockSchedulerClient, simulator Simul
 func (c *Cluster) Start() {
 	ctx := context.TODO()
 	clusterID := c.schedulerClient.GetClusterID(ctx)
-
+	// because I use manjaro as the testing environment,
+	// the tmp dir of the system will make tests blocked forever,
+	// it must be specified a tmp dir in current path.
+	_ = os.RemoveAll("./tmp") // remove old tmp
+	_ = os.Mkdir("./tmp", 0755|os.ModeDir)
 	for storeID := uint64(1); storeID <= uint64(c.count); storeID++ {
-		dbPath, err := ioutil.TempDir("", "test-raftstore")
+		dbPath, err := ioutil.TempDir("./tmp", "test-raftstore")
 		if err != nil {
 			panic(err)
 		}

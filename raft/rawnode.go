@@ -155,7 +155,10 @@ func (rn *RawNode) Ready() Ready {
 		HardState:        pb.HardState{},
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
-		Messages:         rn.Raft.msgs,
+	}
+	if len(rn.Raft.msgs) != 0 {
+		curState.Messages = rn.Raft.msgs
+		rn.Raft.msgs = make([]pb.Message, 0)
 	}
 	curSoftState := rn.Raft.curSoftState()
 	if !isSoftStateEqual(curSoftState, rn.prevSoftState) {
@@ -165,7 +168,6 @@ func (rn *RawNode) Ready() Ready {
 	if !isHardStateEqual(curHardState, rn.prevHardState) {
 		curState.HardState = curHardState
 	}
-	rn.Raft.msgs = make([]pb.Message, 0)
 	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
 		curState.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
 	}
@@ -194,14 +196,16 @@ func (rn *RawNode) Advance(rd Ready) {
 	if !IsEmptyHardState(rd.HardState) {
 		rn.prevHardState = rd.HardState
 	}
+	rLog := rn.Raft.RaftLog
 	if curLen := len(rd.Entries); curLen > 0 {
-		rn.Raft.RaftLog.stabled = rd.Entries[curLen-1].Index
+		rLog.stabled = rd.Entries[curLen-1].Index
 	}
 	if curLen := len(rd.CommittedEntries); curLen > 0 {
-		rn.Raft.RaftLog.applied = rd.CommittedEntries[curLen-1].Index
+		rLog.applied = rd.CommittedEntries[curLen-1].Index
 	}
-	if !IsEmptySnap(&rd.Snapshot) {
-		rn.Raft.RaftLog.pendingSnapshot = nil
+	if !IsEmptySnap(&rd.Snapshot) &&
+		rd.Snapshot.Metadata.Index == rLog.pendingSnapshot.Metadata.Index {
+		rLog.pendingSnapshot = nil
 	}
 }
 
