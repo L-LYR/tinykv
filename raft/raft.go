@@ -569,6 +569,9 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		//- raft_paper_test.go:87:TestLeaderBcastBeat2AA
 		r.broadcast(r.sendHeartbeat)
 	case pb.MessageType_MsgPropose:
+		if r.leadTransferee != None {
+			return ErrProposalDropped
+		}
 		//- When receiving client proposals,
 		//- the leader appends the proposal to its log as a new entry, then issues
 		//- AppendEntries RPCs in parallel to each of the other servers to replicate
@@ -835,7 +838,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		return
 	}
 
-	r.RaftLog.restore(s)
+	r.RaftLog.handleSnapshot(s)
 	//- update ConfState
 	newPrs := make(map[uint64]*Progress)
 	lastIdx := r.RaftLog.LastIndex()

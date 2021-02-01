@@ -130,15 +130,22 @@ func (l *RaftLog) snapshot() (pb.Snapshot, error) {
 	return l.storage.Snapshot()
 }
 
-func (l *RaftLog) restore(s *pb.Snapshot) {
+func (l *RaftLog) handleSnapshot(s *pb.Snapshot) {
 	sIdx := s.Metadata.Index
 	l.committed = sIdx
-	l.stabled = max(l.stabled, sIdx)
-	l.applied = max(l.applied, sIdx)
 	l.entries = nil
 	l.prevSnapIdx = sIdx
 	l.prevSnapTerm = s.Metadata.Term
 	l.pendingSnapshot = s
+}
+
+func (l *RaftLog) advanceSnapshot(s *pb.Snapshot) {
+	sIdx := s.Metadata.Index
+	l.stabled = max(l.stabled, sIdx)
+	l.applied = max(l.applied, sIdx)
+	if sIdx == l.pendingSnapshot.Metadata.Index {
+		l.pendingSnapshot = nil
+	}
 }
 
 // unstableEntries return all the unstable entries
@@ -169,6 +176,17 @@ func (l *RaftLog) Entries(lo uint64) ([]pb.Entry, error) {
 		return nil, ErrUnavailable
 	}
 	if lo > l.LastIndex() || l.LastIndex() == 0 {
+		return nil, nil
+	}
+	return l.entries[l.toSliceIndex(lo):], nil
+}
+
+func (l *RaftLog) getEntries(lo uint64) ([]pb.Entry, error) {
+	if lo < l.FirstIndex() {
+		return nil, ErrUnavailable
+	}
+	lastIndex := l.LastIndex()
+	if lo > lastIndex || lastIndex == 0 {
 		return nil, nil
 	}
 	return l.entries[l.toSliceIndex(lo):], nil
