@@ -38,22 +38,106 @@ func NewServer(storage storage.Storage) *Server {
 // Raw API.
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	ss := server.storage
+	resp := &kvrpcpb.RawGetResponse{}
+
+	sr, err := ss.Reader(req.Context)
+	if err != nil {
+		return resp, err
+	}
+	defer sr.Close()
+
+	val, err := sr.GetCF(req.GetCf(), req.GetKey())
+	if err != nil {
+		return resp, err
+	}
+	resp.Value = val
+	// If not found, both err and val will be nil
+	resp.NotFound = val == nil
+
+	return resp, nil
 }
 
 func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	ss := server.storage
+	resp := &kvrpcpb.RawPutResponse{}
+
+	err := ss.Write(req.Context, []storage.Modify{
+		{
+			Data: storage.Put{
+				Cf:    req.GetCf(),
+				Key:   req.GetKey(),
+				Value: req.GetValue(),
+			},
+		},
+	})
+
+	if err != nil {
+		//? when and how to set RegionError
+		resp.Error = err.Error()
+		return resp, err
+	}
+
+	return resp, nil
 }
 
 func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest) (*kvrpcpb.RawDeleteResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	ss := server.storage
+	resp := &kvrpcpb.RawDeleteResponse{}
+
+	err := ss.Write(req.Context, []storage.Modify{
+		{
+			Data: storage.Delete{
+				Key: req.GetKey(),
+				Cf:  req.GetCf(),
+			},
+		},
+	})
+
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, err
+	}
+
+	return resp, nil
 }
 
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	ss := server.storage
+	resp := &kvrpcpb.RawScanResponse{}
+
+	sr, err := ss.Reader(req.Context)
+	if err != nil {
+		return resp, err
+	}
+	defer sr.Close()
+
+	dbIter := sr.IterCF(req.GetCf())
+	defer dbIter.Close()
+
+	dbIter.Seek(req.GetStartKey())
+	for i := uint32(0); i < req.GetLimit() && dbIter.Valid(); i++ {
+		kvPair := kvrpcpb.KvPair{}
+
+		curItem := dbIter.Item()
+		key := curItem.KeyCopy(nil)
+		val, err := curItem.ValueCopy(nil)
+		if err != nil {
+			// I think if there occurs an error, 'Abort' should be set.
+			// But I cannot find anywhere else using the KeyError.
+			// So I do not know this response is right or not.
+			kvPair.Error = &kvrpcpb.KeyError{Abort: err.Error()}
+		}
+		kvPair.Key = key
+		kvPair.Value = val
+
+		resp.Kvs = append(resp.Kvs, &kvPair)
+		dbIter.Next()
+	}
+	return resp, nil
 }
 
 // Raft commands (tinykv <-> tinykv)
