@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -70,12 +71,20 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	pss *SoftState   // previous soft state
+	phs pb.HardState // previous hard state
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	r := newRaft(config)
+	rn := &RawNode{
+		Raft: r,
+		pss:  r.curSoftState(),
+		phs:  r.curHardState(),
+	}
+	return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -143,19 +152,62 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	r := rn.Raft
+	l := r.RaftLog
+	rd := Ready{
+		Entries:          l.unstableEntries(),
+		CommittedEntries: l.nextEnts(),
+	}
+	if len(r.msgs) > 0 {
+		rd.Messages = r.msgs
+		r.msgs = nil
+	}
+
+	if ss := r.curSoftState(); !isSoftStateEqual(ss, rn.pss) {
+		rd.SoftState = ss
+	}
+	if hs := r.curHardState(); !isHardStateEqual(hs, rn.phs) {
+		rd.HardState = hs
+	}
+
+	return rd
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
-	return false
+	r := rn.Raft
+	l := r.RaftLog
+	// log changed
+	lc := len(r.msgs) > 0 || l.stabled != l.LastIndex() || l.committed != l.applied
+	// soft state changed
+	ssc := !isSoftStateEqual(rn.pss, r.curSoftState())
+	// hard state changed
+	hsc := !isHardStateEqual(rn.phs, r.curHardState())
+	return lc || ssc || hsc
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	if rd.SoftState != nil {
+		rn.pss = rd.SoftState
+	}
+	if !IsEmptyHardState(rd.HardState) {
+		rn.phs = rd.HardState
+	}
+	l := rn.Raft.RaftLog
+	if curLen := len(rd.Entries); curLen > 0 {
+		l.stabled = rd.Entries[curLen-1].Index
+	}
+	if curLen := len(rd.CommittedEntries); curLen > 0 {
+		l.applied = rd.CommittedEntries[curLen-1].Index
+	}
+
+	r := rn.Raft
+	log.Debugf("After Advance Raft %d RaftLog: offset[%d] applied[%d] committed[%d] stabled[%d]",
+		r.id, l.offset, l.applied, l.stabled, l.committed)
 }
 
 // GetProgress return the the Progress of this node and its peers, if this

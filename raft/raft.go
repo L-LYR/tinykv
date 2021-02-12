@@ -16,6 +16,11 @@ package raft
 
 import (
 	"errors"
+	"fmt"
+	"math/rand"
+	"strings"
+
+	"github.com/pingcap-incubator/tinykv/log"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -45,6 +50,9 @@ func (st StateType) String() string {
 // ErrProposalDropped is returned when the proposal is ignored by some cases,
 // so that the proposer can be notified and fail fast.
 var ErrProposalDropped = errors.New("raft proposal dropped")
+
+// ErrInvalidMsgType is returned when the m.MsgType is invalid.
+var ErrInvalidMsgType = errors.New("invalid message type")
 
 // Config contains the parameters to start a raft.
 type Config struct {
@@ -142,6 +150,9 @@ type Raft struct {
 	// Number of ticks since it reached last electionTimeout or received a
 	// valid message from current leader when it is a follower.
 	electionElapsed int
+	// randomized election time which is in range [electiontimeout, 2 * electiontimeout - 1]
+	// which will be changed in role switching.
+	randomElectionTimeout int
 
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in section 3.10 of Raft phd thesis.
@@ -165,75 +176,355 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	l := newLog(c.Storage)
+	r := &Raft{
+		id:      c.ID,
+		RaftLog: l,
+		Prs:     make(map[uint64]*Progress),
+		// when servers start up, they begin as followers.
+		State:                 StateFollower,
+		votes:                 make(map[uint64]bool),
+		msgs:                  nil,
+		heartbeatTimeout:      c.HeartbeatTick,
+		electionTimeout:       c.ElectionTick,
+		randomElectionTimeout: c.ElectionTick + rand.Intn(c.ElectionTick),
+	}
+
+	if hs, _, err := c.Storage.InitialState(); err != nil {
+		log.Panic(err)
+	} else {
+		r.Term = hs.Term
+		r.Vote = hs.Vote
+		l.committed = hs.Commit
+	}
+
+	if c.Applied > 0 {
+		l.applied = c.Applied
+	}
+
+	var prsList []string
+	for _, id := range c.peers {
+		r.Prs[id] = &Progress{}
+		prsList = append(prsList, fmt.Sprint(id))
+	}
+	log.Debugf("new Raft %d: peers[%s] RaftLog: offset[%d] applied[%d] committed[%d] stabled[%d]",
+		r.id, strings.Join(prsList, ","), l.offset, l.applied, l.stabled, l.committed)
+	return r
 }
 
-// sendAppend sends an append RPC with new entries (if any) and the
-// current commit index to the given peer. Returns true if a message was sent.
-func (r *Raft) sendAppend(to uint64) bool {
-	// Your Code Here (2A).
-	return false
+// This is my second attempt for TinyKV,
+// so I try to rearrange the module structure.
+// To not make this file too long,
+// I divide functions into three parts:
+// sending messages, handling messages,
+// and election.
+// election will be implemented in this file.
+// sending messages and handling messages will be
+// implemented in another two files,
+// sendMsgs.go and handleMsgs.go
+
+// lim returns the half number of peers, used for election.
+func (r *Raft) lim() int { return len(r.Prs) / 2 }
+
+// curSoftState returns the current soft state of raft
+func (r *Raft) curSoftState() *SoftState {
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
 }
 
-// sendHeartbeat sends a heartbeat RPC to the given peer.
-func (r *Raft) sendHeartbeat(to uint64) {
-	// Your Code Here (2A).
+// curHardState returns the current hard state of raft
+func (r *Raft) curHardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
+// broadcast will call the same function fn on each peer
+// used in updating progresses and broadcasting messages.
+func (r *Raft) broadcast(fn func(id uint64), ignoreSelf bool) {
+	for id := range r.Prs {
+		if ignoreSelf && id == r.id {
+			continue
+		}
+		fn(id)
+	}
+}
+
+// tickHeartbeat can only be called by leader,
+// who keeps heartbeatElapsed.
+func (r *Raft) tickHeartbeat() {
+	r.heartbeatElapsed++
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		// if the leader receives a heartbeat tick,
+		// it will send a MessageType_MsgHeartbeat
+		// with m.Index = 0, m.LogTerm=0 and empty entries
+		// as heartbeat to all followers.
+		r.heartbeatElapsed = 0
+		_ = r.Step(pb.Message{
+			MsgType: pb.MessageType_MsgBeat,
+			To:      r.id,
+		})
+	}
+}
+
+// tickElection will be called by followers.
+// When occurring timeout, the follower will become
+// candidate and raise a new election.
+func (r *Raft) tickElection() {
+	r.electionElapsed++
+	if r.electionElapsed >= r.randomElectionTimeout {
+		r.electionElapsed = 0
+		_ = r.Step(pb.Message{
+			MsgType: pb.MessageType_MsgHup,
+			To:      r.id,
+		})
+	}
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	if r.State == StateLeader {
+		r.tickHeartbeat()
+	} else {
+		r.tickElection()
+	}
+}
+
+// resetStateInfo will be called when the r's role is changed.
+// It will re-randomized a randomElectionTimeout, reset all the
+// ticking-away variables, reset variables about election.
+func (r *Raft) resetStateInfo() {
+	// In most cases only a
+	// single server(follower or candidate) will time out, which reduces the
+	// likelihood of split vote in the new election.
+	// re-rand when changing state
+	// This can control the ratio of conflicts.
+	r.randomElectionTimeout =
+		r.electionTimeout + rand.Intn(r.electionTimeout)
+
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+
+	r.votes = make(map[uint64]bool)
+
+	lastIdx := r.RaftLog.LastIndex()
+	r.broadcast(func(id uint64) {
+		r.Prs[id].Match = None
+		r.Prs[id].Next = lastIdx + 1
+	}, false)
+	r.Prs[r.id].Match = lastIdx
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	r.resetStateInfo()
+	r.State = StateFollower
+	r.Lead = lead
+	if term != r.Term {
+		r.Term = term
+		r.Vote = None
+	}
+	log.Debugf("%d become Follower at term %d", r.id, r.Term)
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	r.resetStateInfo()
+	r.State = StateCandidate
+	r.Lead = None
+	r.Vote = r.id
+	r.Term++
+	log.Debugf("%d become Candidate at term %d", r.id, r.Term)
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	// Well, in the ./doc/project2-RaftKV.md, it said that
+	// 'The tests assume that the newly elected leader should append a noop entry on its term'.
+	//! I think 'append' is different with 'propose' in this project.
+	r.resetStateInfo()
+	r.State = StateLeader
+	r.Lead = r.id
+
+	log.Debugf("%d become Leader at term %d", r.id, r.Term)
+	_ = r.Step(pb.Message{
+		MsgType: pb.MessageType_MsgPropose,
+		Entries: []*pb.Entry{{Data: nil}},
+	})
+	//r.appendEntries([]*pb.Entry{{Data: nil}})
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	if m.Term == 0 {
+		// local message
+	} else if m.Term > r.Term {
+		// If one server’s current term is
+		// smaller than the other’s, then it updates its current term to the larger
+		// value. If a candidate or leader discovers that its term is out of date,
+		// it immediately reverts to follower state.
+		// Also in stepCandidate.
+		if m.MsgType == pb.MessageType_MsgHeartbeat ||
+			m.MsgType == pb.MessageType_MsgAppend ||
+			m.MsgType == pb.MessageType_MsgSnapshot {
+			r.becomeFollower(m.Term, m.From)
+		} else {
+			r.becomeFollower(m.Term, None)
+		}
+	} else if m.Term < r.Term {
+		//? ignore?
+		log.Debugf("%d ignore a %s message from %d with term %d at term %d",
+			r.id, m.MsgType, m.From, m.Term, r.Term)
+		return nil
+	}
+
 	switch r.State {
 	case StateFollower:
+		return r.stepFollower(m)
 	case StateCandidate:
+		return r.stepCandidate(m)
 	case StateLeader:
+		return r.stepLeader(m)
 	}
 	return nil
 }
 
-// handleAppendEntries handle AppendEntries RPC request
-func (r *Raft) handleAppendEntries(m pb.Message) {
-	// Your Code Here (2A).
+func (r *Raft) stepFollower(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		// if a follower receives no communication
+		// over election timeout, it begins an election to choose a new leader. It
+		// increments its current term and transitions to candidate state. It then
+		// votes for itself and issues RequestVote RPCs in parallel to each of the
+		// other servers in the cluster.
+		r.doElection()
+	//case pb.MessageType_MsgBeat:
+	case pb.MessageType_MsgPropose:
+		return ErrProposalDropped
+	case pb.MessageType_MsgAppend:
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleAppendEntries(m)
+	//case pb.MessageType_MsgAppendResponse:
+	case pb.MessageType_MsgRequestVote:
+		r.handleVoteRequest(m)
+	//case pb.MessageType_MsgRequestVoteResponse:
+	//case pb.MessageType_MsgSnapshot:
+	case pb.MessageType_MsgHeartbeat:
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleHeartbeat(m)
+	//case pb.MessageType_MsgHeartbeatResponse:
+	//case pb.MessageType_MsgTransferLeader:
+	//case pb.MessageType_MsgTimeoutNow:
+	default:
+		log.Debugf("%d received an unexpected message from %d, type: %s, dropped", r.id, m.From, m.MsgType)
+		return ErrInvalidMsgType
+	}
+	return nil
 }
 
-// handleHeartbeat handle Heartbeat RPC request
-func (r *Raft) handleHeartbeat(m pb.Message) {
-	// Your Code Here (2A).
+func (r *Raft) stepCandidate(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		// Also if a candidate fails to obtain a majority, it will time out and
+		// start a new election by incrementing its term and initiating another
+		// round of RequestVote RPCs.
+		r.doElection()
+	//case pb.MessageType_MsgBeat:
+	case pb.MessageType_MsgPropose:
+		return ErrProposalDropped
+	case pb.MessageType_MsgAppend:
+		// while waiting for votes,
+		// if a candidate receives an AppendEntries RPC from another server claiming
+		// to be leader whose term is at least as large as the candidate's current term,
+		// it recognizes the leader as legitimate and returns to follower state.
+		r.becomeFollower(m.Term, m.From)
+		r.handleAppendEntries(m)
+	//case pb.MessageType_MsgAppendResponse:
+	case pb.MessageType_MsgRequestVote:
+		// all state should handle MsgRequestVote RPC
+		r.handleVoteRequest(m)
+	case pb.MessageType_MsgRequestVoteResponse:
+		r.receiveVote(m.From, m.Reject)
+	//case pb.MessageType_MsgSnapshot:
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From)
+		r.handleHeartbeat(m)
+	//case pb.MessageType_MsgHeartbeatResponse:
+	//case pb.MessageType_MsgTransferLeader:
+	//case pb.MessageType_MsgTimeoutNow:
+	default:
+		log.Debugf("%d received an unexpected message from %d, type: %s, dropped", r.id, m.From, m.MsgType)
+		return ErrInvalidMsgType
+	}
+	return nil
 }
 
-// handleSnapshot handle Snapshot RPC request
-func (r *Raft) handleSnapshot(m pb.Message) {
-	// Your Code Here (2C).
+func (r *Raft) stepLeader(m pb.Message) error {
+	switch m.MsgType {
+	//case pb.MessageType_MsgHup:
+	case pb.MessageType_MsgBeat:
+		r.broadcast(r.sendHeartbeat, true)
+	case pb.MessageType_MsgPropose:
+		return r.handlePropose(m)
+	//case pb.MessageType_MsgAppend:
+	case pb.MessageType_MsgAppendResponse:
+		r.handleAppendResponse(m)
+	case pb.MessageType_MsgRequestVote:
+		r.handleVoteRequest(m)
+	//case pb.MessageType_MsgRequestVoteResponse:
+	//case pb.MessageType_MsgSnapshot:
+	//case pb.MessageType_MsgHeartbeat:
+	case pb.MessageType_MsgHeartbeatResponse:
+		r.handleHeartbeatResponse(m)
+	//case pb.MessageType_MsgTransferLeader:
+	//case pb.MessageType_MsgTimeoutNow:
+	default:
+		log.Debugf("%d received an unexpected message from %d, type: %s, dropped", r.id, m.From, m.MsgType)
+		return ErrInvalidMsgType
+	}
+	return nil
 }
 
-// addNode add a new node to raft group
-func (r *Raft) addNode(id uint64) {
-	// Your Code Here (3A).
+// doElection is called by Followers when stepping MsgHup
+func (r *Raft) doElection() {
+	r.becomeCandidate()
+	r.Vote = r.id
+	r.receiveVote(r.id, false) // vote itself
+	r.broadcast(r.sendVoteRequest, true)
 }
 
-// removeNode remove a node from raft group
-func (r *Raft) removeNode(id uint64) {
-	// Your Code Here (3A).
+// receiveVote is called by candidates after receiving vote responses.
+func (r *Raft) receiveVote(from uint64, reject bool) {
+	r.votes[from] = !reject
+	gain, lose := 0, 0
+	for _, pv := range r.votes {
+		if pv {
+			gain++
+		} else {
+			lose++
+		}
+	}
+	// win the election when receiving votes from a majority of the servers
+	if gain > r.lim() {
+		r.becomeLeader()
+		return
+	}
+	if lose > r.lim() {
+		r.becomeFollower(r.Term, None)
+		return
+	}
+	// stay in candidate if it does not obtain the majority
 }
