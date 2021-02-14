@@ -29,20 +29,76 @@ const (
 type peerMsgHandler struct {
 	*peer
 	ctx *GlobalContext
+	// this is used to apply msgs asynchronously.
+	applyCh chan []message.Msg
 }
 
-func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
+func newPeerMsgHandler(peer *peer, applyCh chan []message.Msg, ctx *GlobalContext) *peerMsgHandler {
 	return &peerMsgHandler{
-		peer: peer,
-		ctx:  ctx,
+		peer:    peer,
+		ctx:     ctx,
+		applyCh: applyCh,
 	}
 }
 
 func (d *peerMsgHandler) HandleRaftReady() {
+	// Your Code Here (2B).
+	// for {
+	//  select {
+	//  case <-s.Ticker:
+	//    Node.Tick()
+	//  default:
+	//    if Node.HasReady() {
+	//      rd := Node.Ready()
+	//      saveToStorage(rd.State, rd.Entries, rd.Snapshot)
+	//      send(rd.Messages)
+	//      for _, entry := range rd.CommittedEntries {
+	//        process(entry)
+	//      }
+	//      s.Node.Advance(rd)
+	//    }
+	// }
 	if d.stopped {
 		return
 	}
-	// Your Code Here (2B).
+
+	if !d.RaftGroup.HasReady() {
+		return
+	}
+
+	applyMsgs := make([]message.Msg, 0)
+	rd := d.RaftGroup.Ready()
+
+	res, err := d.peerStorage.SaveReadyState(&rd)
+	if err != nil {
+		log.Panic(err)
+	}
+	if res != nil {
+		// handle snapApplyRes
+		// remember to update applier
+	}
+
+	if len(rd.Messages) > 0 {
+		d.Send(d.ctx.trans, rd.Messages)
+	}
+
+	if cLen := len(rd.CommittedEntries); cLen > 0 {
+		applyMsgs = append(applyMsgs, message.Msg{
+			Type:     message.MsgTypeApplyProposals,
+			RegionID: d.regionId,
+			Data: &MsgApplyProposal{
+				proposals: d.proposals,
+				entries:   rd.CommittedEntries,
+			},
+		})
+		d.LastApplyingIndex = rd.CommittedEntries[cLen-1].Index
+		d.proposals = nil
+	}
+
+	d.applyCh <- applyMsgs
+
+	d.RaftGroup.Advance(rd)
+
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -107,13 +163,59 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	return err
 }
 
+func (d *peerMsgHandler) appendProposal(idx uint64, cb *message.Callback) {
+	d.proposals = append(d.proposals, &proposal{
+		index: idx,
+		term:  d.Term(),
+		cb:    cb,
+	})
+}
+
+func (d *peerMsgHandler) proposeNormalReq(req *raft_cmdpb.RaftCmdRequest) (uint64, error) {
+	var err error
+	data, err := req.Marshal()
+	if err != nil {
+		return 0, err
+	}
+	idx := d.nextProposalIndex()
+	err = d.RaftGroup.Propose(data)
+	if err != nil {
+		return 0, err
+	}
+	if idx == d.nextProposalIndex() {
+		// no leader error
+		return 0, fmt.Errorf("proposal message dropped")
+	}
+
+	return idx, nil
+}
+
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
 		cb.Done(ErrResp(err))
 		return
 	}
+	// check region
+	if d.stopped {
+		NotifyReqRegionRemoved(d.regionId, cb)
+		return
+	}
 	// Your Code Here (2B).
+	// bind term
+	// identify what kind of request it is.
+	if msg.AdminRequest != nil {
+
+	}
+
+	if len(msg.Requests) > 0 {
+		i, err := d.proposeNormalReq(msg)
+		if err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+		d.appendProposal(i, cb)
+	}
 }
 
 func (d *peerMsgHandler) onTick() {

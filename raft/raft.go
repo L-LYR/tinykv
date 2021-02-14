@@ -190,9 +190,12 @@ func newRaft(c *Config) *Raft {
 		randomElectionTimeout: c.ElectionTick + rand.Intn(c.ElectionTick),
 	}
 
-	if hs, _, err := c.Storage.InitialState(); err != nil {
+	hs, cs, err := c.Storage.InitialState()
+	if err != nil {
 		log.Panic(err)
-	} else {
+	}
+
+	if !IsEmptyHardState(hs) {
 		r.Term = hs.Term
 		r.Vote = hs.Vote
 		l.committed = hs.Commit
@@ -202,8 +205,13 @@ func newRaft(c *Config) *Raft {
 		l.applied = c.Applied
 	}
 
+	prs := c.peers
+	if cs.Nodes != nil {
+		prs = cs.Nodes
+	}
+
 	var prsList []string
-	for _, id := range c.peers {
+	for _, id := range prs {
 		r.Prs[id] = &Progress{}
 		prsList = append(prsList, fmt.Sprint(id))
 	}
@@ -430,7 +438,7 @@ func (r *Raft) stepFollower(m pb.Message) error {
 	//case pb.MessageType_MsgTimeoutNow:
 	default:
 		log.Debugf("%d received an unexpected message from %d, type: %s, dropped", r.id, m.From, m.MsgType)
-		return ErrInvalidMsgType
+		//return ErrInvalidMsgType
 	}
 	return nil
 }
@@ -467,7 +475,7 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 	//case pb.MessageType_MsgTimeoutNow:
 	default:
 		log.Debugf("%d received an unexpected message from %d, type: %s, dropped", r.id, m.From, m.MsgType)
-		return ErrInvalidMsgType
+		//return ErrInvalidMsgType
 	}
 	return nil
 }
@@ -493,7 +501,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	//case pb.MessageType_MsgTimeoutNow:
 	default:
 		log.Debugf("%d received an unexpected message from %d, type: %s, dropped", r.id, m.From, m.MsgType)
-		return ErrInvalidMsgType
+		//return ErrInvalidMsgType
 	}
 	return nil
 }

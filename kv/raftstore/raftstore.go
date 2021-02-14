@@ -265,12 +265,14 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	ctx := bs.ctx
 	workers := bs.workers
 	router := bs.router
-	bs.wg.Add(2) // raftWorker, storeWorker
+	bs.wg.Add(3) // raftWorker, storeWorker, applyWorker
 	rw := newRaftWorker(ctx, router)
 	go rw.run(bs.closeCh, bs.wg)
 	sw := newStoreWorker(ctx, bs.storeState)
 	go sw.run(bs.closeCh, bs.wg)
 	router.sendStore(message.Msg{Type: message.MsgTypeStoreStart, Data: ctx.store})
+	aw := newApplyWorker(ctx, rw.applyCh, router)
+	go aw.run(bs.closeCh, bs.wg)
 	for i := 0; i < len(peers); i++ {
 		regionID := peers[i].regionId
 		_ = router.send(regionID, message.Msg{RegionID: regionID, Type: message.MsgTypeStart})

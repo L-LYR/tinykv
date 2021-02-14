@@ -38,6 +38,9 @@ const (
 	MsgTypeStoreTick MsgType = 106
 	// message to start the ticker of store
 	MsgTypeStoreStart MsgType = 107
+
+	// message of records of callbacks
+	MsgTypeApplyProposals MsgType = 201
 )
 
 type Msg struct {
