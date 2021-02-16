@@ -92,7 +92,7 @@ func newApplyWorker(ctx *GlobalContext, applyCh chan []message.Msg, pr *router) 
 		pr:      pr,
 		applyCh: applyCh,
 		ctx:     ctx,
-		aCtx:    newApplyContext(ctx.engine),
+		aCtx:    newApplyContext(ctx.engine, pr),
 	}
 }
 

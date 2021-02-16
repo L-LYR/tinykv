@@ -17,19 +17,43 @@ type MsgApplyProposal struct {
 	entries   []pb.Entry
 }
 
-// applyContext
-type applyContext struct {
-	engines *engine_util.Engines
-	wb      *engine_util.WriteBatch
-	//res
-	cbs []*message.Callback
+// apply result
+type MsgApplyResult struct {
+	applyState *rspb.RaftApplyState
+	results    []ApplyResult
 }
 
-func newApplyContext(engines *engine_util.Engines) *applyContext {
+type ApplyResultType int
+
+const (
+	ResType_CompactLog ApplyResultType = iota
+)
+
+type ApplyResult struct {
+	resType ApplyResultType
+	// used for compact log
+	compactLogIndex uint64
+}
+
+// applyContext
+type applyContext struct {
+	pr      *router
+	engines *engine_util.Engines
+	wb      *engine_util.WriteBatch
+	res     MsgApplyResult
+	cbs     []*message.Callback
+}
+
+func newApplyContext(engines *engine_util.Engines, pr *router) *applyContext {
 	return &applyContext{
+		pr:      pr,
 		engines: engines,
 		wb:      new(engine_util.WriteBatch),
 	}
+}
+
+func (ac *applyContext) appendResult(r *ApplyResult) {
+	ac.res.results = append(ac.res.results, *r)
 }
 
 func (ac *applyContext) appendCallback(cb *message.Callback) {
@@ -57,11 +81,13 @@ func newApplyMsgHandler(applier *applier, aCtx *applyContext) *applyMsgHandler {
 	if err != nil {
 		log.Panic(err)
 	}
-	return &applyMsgHandler{
+	a := &applyMsgHandler{
 		applier:    applier,
 		aCtx:       aCtx,
 		applyState: curState,
 	}
+	a.aCtx.res.applyState = curState
+	return a
 }
 
 func (a *applyMsgHandler) handleApplyMsg(msg message.Msg) {
@@ -86,6 +112,15 @@ func (a *applyMsgHandler) handleProposal(m *MsgApplyProposal) {
 	}
 	a.doCurrentWB()
 	a.aCtx.done()
+	// send apply results to peerMsgHandler
+	err := a.aCtx.pr.send(a.region.Id, message.Msg{
+		Type:     message.MsgTypeApplyResult,
+		RegionID: a.region.Id,
+		Data:     &a.aCtx.res,
+	})
+	if err != nil {
+		log.Panic(err)
+	}
 }
 
 func (a *applyMsgHandler) apply(entry *pb.Entry) {
@@ -97,9 +132,36 @@ func (a *applyMsgHandler) apply(entry *pb.Entry) {
 		log.Panic(err)
 	}
 	if req.AdminRequest != nil {
-		// admin request
+		a.handleAdminRequests(req.AdminRequest)
 	} else if len(req.Requests) > 0 {
 		a.handleNormalRequests(entry, req)
+	}
+}
+
+func (a *applyMsgHandler) handleCompactLog(admin *raft_cmdpb.AdminRequest) {
+	compactLog := admin.CompactLog
+	cIdx, cTerm := compactLog.CompactIndex, compactLog.CompactTerm
+	res := a.aCtx.res
+	pIdx := res.applyState.TruncatedState.Index // previous truncated index
+	if cIdx >= pIdx {
+		res.applyState.TruncatedState = &rspb.RaftTruncatedState{
+			Index: cIdx,
+			Term:  cTerm,
+		}
+		a.applyState = res.applyState
+		a.doCurrentWB()
+		cRes := &ApplyResult{
+			resType:         ResType_CompactLog,
+			compactLogIndex: cIdx,
+		}
+		a.aCtx.appendResult(cRes)
+	}
+}
+
+func (a *applyMsgHandler) handleAdminRequests(admin *raft_cmdpb.AdminRequest) {
+	switch admin.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		a.handleCompactLog(admin)
 	}
 }
 

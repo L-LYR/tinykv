@@ -74,8 +74,16 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		log.Panic(err)
 	}
 	if res != nil {
-		// handle snapApplyRes
-		// remember to update applier
+		// previous region & current region
+		pRegion, cRegion := res.PrevRegion, res.Region
+		log.Infof("%s snapshot for region %s is applied", d.Tag, cRegion)
+		m := d.ctx.storeMeta
+		if len(pRegion.Peers) > 0 {
+			log.Infof("region changed from %s to %s", pRegion, cRegion)
+			m.regionRanges.Delete(&regionItem{region: pRegion})
+		}
+		m.regionRanges.ReplaceOrInsert(&regionItem{region: cRegion})
+		m.regions[cRegion.Id] = cRegion
 	}
 
 	if len(rd.Messages) > 0 {
@@ -95,10 +103,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		d.proposals = nil
 	}
 
-	d.applyCh <- applyMsgs
-
 	d.RaftGroup.Advance(rd)
 
+	d.applyCh <- applyMsgs
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -124,6 +131,9 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 		d.onGCSnap(gcSnap.Snaps)
 	case message.MsgTypeStart:
 		d.startTicker()
+	case message.MsgTypeApplyResult:
+		applyRes := msg.Data.(*MsgApplyResult)
+		d.onApplyResult(applyRes)
 	}
 }
 
@@ -171,6 +181,35 @@ func (d *peerMsgHandler) appendProposal(idx uint64, cb *message.Callback) {
 	})
 }
 
+//func (d *peerMsgHandler) proposeCompactLog(admin *raft_cmdpb.AdminRequest) (uint64, error) {
+//	data, err := admin.Marshal()
+//	if err != nil {
+//		return 0, err
+//	}
+//	idx := d.nextProposalIndex()
+//	err = d.RaftGroup.Propose(data)
+//	if err != nil {
+//		return 0, err
+//	}
+//	if idx == d.nextProposalIndex() {
+//		// no leader error
+//		return 0, fmt.Errorf("proposal message dropped")
+//	}
+//	return idx, nil
+//}
+
+func (d *peerMsgHandler) proposeAdminReq(req *raft_cmdpb.RaftCmdRequest) (uint64, error) {
+	admin := req.AdminRequest
+	switch admin.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		// CompactLog is just like the normal request
+		return d.proposeNormalReq(req)
+	default:
+		log.Panicf("Unexpect Req!")
+	}
+	return 0, nil
+}
+
 func (d *peerMsgHandler) proposeNormalReq(req *raft_cmdpb.RaftCmdRequest) (uint64, error) {
 	var err error
 	data, err := req.Marshal()
@@ -204,18 +243,17 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	// Your Code Here (2B).
 	// bind term
 	// identify what kind of request it is.
+	var i uint64
 	if msg.AdminRequest != nil {
-
+		i, err = d.proposeAdminReq(msg)
+	} else if len(msg.Requests) > 0 {
+		i, err = d.proposeNormalReq(msg)
 	}
-
-	if len(msg.Requests) > 0 {
-		i, err := d.proposeNormalReq(msg)
-		if err != nil {
-			cb.Done(ErrResp(err))
-			return
-		}
-		d.appendProposal(i, cb)
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
 	}
+	d.appendProposal(i, cb)
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -672,4 +710,18 @@ func newCompactLogRequest(regionID uint64, peer *metapb.Peer, compactIndex, comp
 		},
 	}
 	return req
+}
+
+func (d *peerMsgHandler) onApplyResult(res *MsgApplyResult) {
+	d.peerStorage.applyState = res.applyState
+	for _, r := range res.results {
+		switch r.resType {
+		case ResType_CompactLog:
+			if d.LastCompactedIdx < r.compactLogIndex {
+				// without this check
+				// it will print a lot of 'no need to gc' infos.
+				d.ScheduleCompactLog(r.compactLogIndex)
+			}
+		}
+	}
 }

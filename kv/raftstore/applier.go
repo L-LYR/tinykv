@@ -25,14 +25,6 @@ func newApplier(peer *peer) *applier {
 	}
 }
 
-// NotifyAllStale clears the proposal up when applier is removed.
-func (a *applier) NotifyAllStale() {
-	for _, p := range a.proposals {
-		NotifyStaleReq(a.term, p.cb)
-	}
-	a.proposals = nil
-}
-
 func (a *applier) appendProposals(ps []*proposal) {
 	a.proposals = append(a.proposals, ps...)
 }

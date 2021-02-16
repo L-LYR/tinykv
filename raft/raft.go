@@ -37,6 +37,15 @@ const (
 	StateLeader
 )
 
+// SnapStateType represents the state of snapshot.
+// It will help to avoid repeatedly generate too many snapshots.
+type SnapStateType uint64
+
+const (
+	StateNormal SnapStateType = iota
+	StatePending
+)
+
 var stmap = [...]string{
 	"StateFollower",
 	"StateCandidate",
@@ -115,6 +124,14 @@ type Progress struct {
 	Match, Next uint64
 }
 
+// Because in 2C, there will be a lot of snapshot request, SnapProgress is used to tell
+// the leader whether and when to send or resend snapshot.
+type SnapProgress struct {
+	state      SnapStateType
+	resendTick int
+	pendingIdx uint64
+}
+
 type Raft struct {
 	id uint64
 
@@ -126,6 +143,8 @@ type Raft struct {
 
 	// log replication progress of each peers
 	Prs map[uint64]*Progress
+	// snapshot progress of each peers
+	sPrs map[uint64]*SnapProgress
 
 	// this peer's role
 	State StateType
@@ -181,6 +200,7 @@ func newRaft(c *Config) *Raft {
 		id:      c.ID,
 		RaftLog: l,
 		Prs:     make(map[uint64]*Progress),
+		sPrs:    make(map[uint64]*SnapProgress),
 		// when servers start up, they begin as followers.
 		State:                 StateFollower,
 		votes:                 make(map[uint64]bool),
@@ -212,6 +232,7 @@ func newRaft(c *Config) *Raft {
 
 	var prsList []string
 	for _, id := range prs {
+		r.sPrs[id] = &SnapProgress{}
 		r.Prs[id] = &Progress{}
 		prsList = append(prsList, fmt.Sprint(id))
 	}
@@ -293,11 +314,28 @@ func (r *Raft) tickElection() {
 	}
 }
 
+// tickResendSnap will be called by leader.
+// When occurring timeout, the leader will set
+// StatePending to StateNormal and then it can resend
+// a snapshot.
+func (r *Raft) tickResendSnap() {
+	r.broadcast(func(id uint64) {
+		spr := r.sPrs[id]
+		if spr.state == StatePending {
+			spr.resendTick++
+			if spr.resendTick >= r.electionTimeout {
+				spr.state = StateNormal
+			}
+		}
+	}, true)
+}
+
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
 	if r.State == StateLeader {
 		r.tickHeartbeat()
+		r.tickResendSnap()
 	} else {
 		r.tickElection()
 	}
@@ -319,13 +357,6 @@ func (r *Raft) resetStateInfo() {
 	r.heartbeatElapsed = 0
 
 	r.votes = make(map[uint64]bool)
-
-	lastIdx := r.RaftLog.LastIndex()
-	r.broadcast(func(id uint64) {
-		r.Prs[id].Match = None
-		r.Prs[id].Next = lastIdx + 1
-	}, false)
-	r.Prs[r.id].Match = lastIdx
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -362,7 +393,14 @@ func (r *Raft) becomeLeader() {
 	r.resetStateInfo()
 	r.State = StateLeader
 	r.Lead = r.id
-
+	lastIdx := r.RaftLog.LastIndex()
+	r.broadcast(func(id uint64) {
+		r.Prs[id].Match = None
+		r.Prs[id].Next = lastIdx + 1
+		r.sPrs[id].state = StateNormal
+		r.sPrs[id].resendTick = 0
+	}, false)
+	r.Prs[r.id].Match = lastIdx
 	log.Debugf("%d become Leader at term %d", r.id, r.Term)
 	_ = r.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
@@ -428,7 +466,10 @@ func (r *Raft) stepFollower(m pb.Message) error {
 	case pb.MessageType_MsgRequestVote:
 		r.handleVoteRequest(m)
 	//case pb.MessageType_MsgRequestVoteResponse:
-	//case pb.MessageType_MsgSnapshot:
+	case pb.MessageType_MsgSnapshot:
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.electionElapsed = 0
 		r.Lead = m.From
@@ -466,7 +507,9 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		r.handleVoteRequest(m)
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.receiveVote(m.From, m.Reject)
-	//case pb.MessageType_MsgSnapshot:
+	case pb.MessageType_MsgSnapshot:
+		r.becomeFollower(m.Term, m.From)
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.becomeFollower(m.Term, m.From)
 		r.handleHeartbeat(m)

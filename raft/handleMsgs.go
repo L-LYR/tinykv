@@ -92,6 +92,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 // handleAppendResponse handle AppendResponse RPC response
 func (r *Raft) handleAppendResponse(m pb.Message) {
 	pr := r.Prs[m.From]
+	spr := r.sPrs[m.From]
 	if m.Reject {
 		// non-leader node refused to append
 		// leader could bring a follower's log
@@ -109,6 +110,11 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 		if r.doCommit() {
 			r.broadcast(func(id uint64) { r.sendAppend(id) }, true)
 		}
+	}
+	if pr.Match > spr.pendingIdx {
+		spr.state = StateNormal
+		spr.pendingIdx = 0
+		spr.resendTick = 0
 	}
 	// leadTransferee
 }
@@ -149,6 +155,30 @@ func (r *Raft) handleVoteRequest(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	s := m.Snapshot
+	sm := s.Metadata
+	sIdx, sTerm := sm.Index, sm.Term
+	// check term
+	term, _ := r.RaftLog.Term(sIdx)
+	if term == sTerm {
+		r.sendAppendResponse(m.From, false, r.RaftLog.committed)
+		return
+	}
+	r.RaftLog.storeSnap(s)
+
+	// update conf
+	lastIdx := r.RaftLog.LastIndex()
+	r.Prs = make(map[uint64]*Progress)
+	for _, id := range sm.ConfState.Nodes {
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  lastIdx + 1,
+		}
+		r.sPrs[id] = &SnapProgress{}
+	}
+	r.Prs[r.id].Match = lastIdx
+
+	r.sendAppendResponse(m.From, false, r.RaftLog.LastIndex())
 }
 
 // addNode add a new node to raft group

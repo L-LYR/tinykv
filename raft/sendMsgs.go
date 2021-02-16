@@ -31,6 +31,10 @@ func (r *Raft) send(m pb.Message) {
 		if m.MsgType == pb.MessageType_MsgRequestVoteResponse {
 			info += fmt.Sprintf(", reject: %v", m.Reject)
 		}
+		if m.MsgType == pb.MessageType_MsgSnapshot {
+			sm := m.Snapshot.Metadata
+			info += fmt.Sprintf(", snapshot index: %d term: %d", sm.Index, sm.Term)
+		}
 		log.Debugf("%s", info)
 	}
 	r.msgs = append(r.msgs, m)
@@ -46,7 +50,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	ents, getEntryErr := r.RaftLog.EntrySliceFrom(nextIdx)
 	if getTermErr != nil || getEntryErr != nil {
 		log.Debugf("getTermErr: %v\ngetEntryErr: %v", getTermErr, getEntryErr)
-		return false
+		return r.sendSnapshot(to)
 	}
 	entps := make([]*pb.Entry, 0, len(ents))
 	for i := range ents {
@@ -67,7 +71,38 @@ func (r *Raft) sendAppend(to uint64) bool {
 	return false
 }
 
-// sendAppendResponse sends a append entries response to the given peer
+// sendSnapshot sends snapshot to the given peer.
+func (r *Raft) sendSnapshot(to uint64) bool {
+	spr := r.sPrs[to]
+	if spr.state == StatePending {
+		return false
+	}
+	snapshot, err := r.RaftLog.snapshot()
+	if err != nil {
+		if err == ErrSnapshotTemporarilyUnavailable {
+			log.Debugf("%d failed to send snapshot to %d", r.id, to)
+			return false
+		}
+		log.Panic(err)
+	}
+	if IsEmptySnap(&snapshot) {
+		log.Panicf("Empty Snapshot!")
+	}
+	m := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		To:       to,
+		From:     r.id,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	}
+	r.send(m)
+	spr.state = StatePending
+	spr.resendTick = 0
+	spr.pendingIdx = snapshot.Metadata.Index
+	return true
+}
+
+// sendAppendResponse sends an append entries response to the given peer
 func (r *Raft) sendAppendResponse(to uint64, reject bool, index uint64) {
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse,

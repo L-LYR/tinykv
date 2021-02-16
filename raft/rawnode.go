@@ -169,7 +169,9 @@ func (rn *RawNode) Ready() Ready {
 	if hs := r.curHardState(); !isHardStateEqual(hs, rn.phs) {
 		rd.HardState = hs
 	}
-
+	if l.pendingSnapshot != nil {
+		rd.Snapshot = *r.RaftLog.pendingSnapshot
+	}
 	return rd
 }
 
@@ -178,13 +180,16 @@ func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
 	r := rn.Raft
 	l := r.RaftLog
+	s := l.pendingSnapshot
 	// log changed
-	lc := len(r.msgs) > 0 || l.stabled != l.LastIndex() || l.committed != l.applied
+	lc := len(r.msgs) > 0 || l.hasUnstableEnts() || l.hasNextEnts()
 	// soft state changed
 	ssc := !isSoftStateEqual(rn.pss, r.curSoftState())
 	// hard state changed
 	hsc := !isHardStateEqual(rn.phs, r.curHardState())
-	return lc || ssc || hsc
+	// has snapshot
+	hs := s != nil && !IsEmptySnap(s)
+	return lc || ssc || hsc || hs
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
@@ -204,7 +209,15 @@ func (rn *RawNode) Advance(rd Ready) {
 	if curLen := len(rd.CommittedEntries); curLen > 0 {
 		l.applied = rd.CommittedEntries[curLen-1].Index
 	}
-
+	if !IsEmptySnap(&rd.Snapshot) {
+		i := rd.Snapshot.Metadata.Index
+		l.stabled = max(l.stabled, i)
+		l.applied = max(l.applied, i)
+		s := l.pendingSnapshot
+		if !IsEmptySnap(s) && s.Metadata.Index == i {
+			l.pendingSnapshot = nil
+		}
+	}
 	r := rn.Raft
 	log.Debugf("After Advance Raft %d RaftLog: offset[%d] applied[%d] committed[%d] stabled[%d]",
 		r.id, l.offset, l.applied, l.stabled, l.committed)

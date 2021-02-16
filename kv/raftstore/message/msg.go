@@ -41,6 +41,8 @@ const (
 
 	// message of records of callbacks
 	MsgTypeApplyProposals MsgType = 201
+	// message of apply result
+	MsgTypeApplyResult MsgType = 202
 )
 
 type Msg struct {
