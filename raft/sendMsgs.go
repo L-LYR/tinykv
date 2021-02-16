@@ -129,6 +129,17 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	r.send(m)
 }
 
+func (r *Raft) sendTimeoutNow(to uint64) {
+	r.leadTransferee = None
+	m := pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+	}
+	r.send(m)
+}
+
 // sendHeartbeatResponse sends a heartbeat response to the given peer.
 func (r *Raft) sendHeartbeatResponse(to uint64) {
 	m := pb.Message{

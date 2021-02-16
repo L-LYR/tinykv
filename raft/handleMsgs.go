@@ -36,6 +36,16 @@ func (r *Raft) doCommit() bool {
 
 // handlePropose handle local Propose request
 func (r *Raft) handlePropose(m pb.Message) error {
+	if !r.isValidID(r.id) {
+		log.Debugf("%d has been removed", r.id)
+		return ErrProposalDropped
+	}
+
+	if r.leadTransferee != None {
+		log.Debugf("leader is transferring from %d to %d", r.id, r.leadTransferee)
+		return ErrProposalDropped
+	}
+
 	entries := m.Entries
 	log.Debugf("%d begin to propose %d entries", r.id, len(entries))
 	// check valid id
@@ -45,6 +55,14 @@ func (r *Raft) handlePropose(m pb.Message) error {
 	for i := range entries {
 		entries[i].Term = r.Term
 		entries[i].Index = lastIdx + 1 + uint64(i)
+		if entries[i].EntryType == pb.EntryType_EntryConfChange {
+			if r.PendingConfIndex > r.RaftLog.applied {
+				entries[i].EntryType = pb.EntryType_EntryNormal
+				entries[i].Data = nil
+			} else {
+				r.PendingConfIndex = entries[i].Index
+			}
+		}
 	}
 	r.RaftLog.appendEntries(entries)
 	lastIdx = r.RaftLog.LastIndex()
@@ -116,6 +134,9 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 		spr.pendingIdx = 0
 		spr.resendTick = 0
 	}
+	if r.leadTransferee == m.From && pr.Match == r.RaftLog.LastIndex() {
+		r.sendTimeoutNow(r.leadTransferee)
+	}
 	// leadTransferee
 }
 
@@ -181,12 +202,77 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	r.sendAppendResponse(m.From, false, r.RaftLog.LastIndex())
 }
 
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	if !r.isValidID(m.From) {
+		// invalid id
+		return
+	}
+	if r.State == StateFollower {
+		m.To = r.Lead
+		r.send(m)
+		return
+	}
+	if m.From == r.id {
+		// self-transfer
+		return
+	}
+	if r.leadTransferee != None && m.From == r.leadTransferee {
+		// pending
+		return
+	}
+	r.leadTransferee = m.From
+	r.transferLeaderElapsed = 0
+	if r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		r.sendTimeoutNow(m.From)
+	} else {
+		r.sendAppend(m.From)
+	}
+}
+
+// isValidID checks the id
+func (r *Raft) isValidID(id uint64) bool {
+	if _, has := r.Prs[id]; !has {
+		return false
+	}
+	return true
+}
+
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	r.PendingConfIndex = None
+	if !r.isValidID(id) {
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  r.RaftLog.LastIndex() + 1,
+		}
+		r.sPrs[id] = &SnapProgress{
+			state:      StateNormal,
+			resendTick: 0,
+			pendingIdx: 0,
+		}
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	r.PendingConfIndex = None
+	if !r.isValidID(id) {
+		return
+	}
+	delete(r.Prs, id)
+	delete(r.sPrs, id)
+	if len(r.Prs) == 0 {
+		return
+	}
+	if r.State == StateLeader {
+		if r.doCommit() {
+			r.broadcast(func(id uint64) { r.sendAppend(id) }, true)
+		}
+		if r.leadTransferee == id {
+			r.leadTransferee = None
+			r.transferLeaderElapsed = 0
+		}
+	}
 }

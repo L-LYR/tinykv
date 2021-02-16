@@ -172,6 +172,10 @@ type Raft struct {
 	// randomized election time which is in range [electiontimeout, 2 * electiontimeout - 1]
 	// which will be changed in role switching.
 	randomElectionTimeout int
+	// number of ticks after it begins to transfer leader.
+	// its limit is electionTimeout.
+	// only leader keeps transferLeaderElapsed.
+	transferLeaderElapsed int
 
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in section 3.10 of Raft phd thesis.
@@ -330,12 +334,21 @@ func (r *Raft) tickResendSnap() {
 	}, true)
 }
 
+func (r *Raft) tickTransferLeader() {
+	r.transferLeaderElapsed++
+	if r.leadTransferee != None && r.transferLeaderElapsed >= r.electionTimeout {
+		r.transferLeaderElapsed = 0
+		r.leadTransferee = None
+	}
+}
+
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
 	if r.State == StateLeader {
 		r.tickHeartbeat()
 		r.tickResendSnap()
+		r.tickTransferLeader()
 	} else {
 		r.tickElection()
 	}
@@ -352,10 +365,11 @@ func (r *Raft) resetStateInfo() {
 	// This can control the ratio of conflicts.
 	r.randomElectionTimeout =
 		r.electionTimeout + rand.Intn(r.electionTimeout)
-
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
-
+	r.transferLeaderElapsed = 0
+	r.leadTransferee = None
+	r.PendingConfIndex = 0
 	r.votes = make(map[uint64]bool)
 }
 
@@ -475,8 +489,10 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.Lead = m.From
 		r.handleHeartbeat(m)
 	//case pb.MessageType_MsgHeartbeatResponse:
-	//case pb.MessageType_MsgTransferLeader:
-	//case pb.MessageType_MsgTimeoutNow:
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
+	case pb.MessageType_MsgTimeoutNow:
+		r.doElection()
 	default:
 		log.Debugf("%d received an unexpected message from %d, type: %s, dropped", r.id, m.From, m.MsgType)
 		//return ErrInvalidMsgType
@@ -514,7 +530,8 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		r.becomeFollower(m.Term, m.From)
 		r.handleHeartbeat(m)
 	//case pb.MessageType_MsgHeartbeatResponse:
-	//case pb.MessageType_MsgTransferLeader:
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	//case pb.MessageType_MsgTimeoutNow:
 	default:
 		log.Debugf("%d received an unexpected message from %d, type: %s, dropped", r.id, m.From, m.MsgType)
@@ -540,7 +557,8 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	//case pb.MessageType_MsgHeartbeat:
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.handleHeartbeatResponse(m)
-	//case pb.MessageType_MsgTransferLeader:
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	//case pb.MessageType_MsgTimeoutNow:
 	default:
 		log.Debugf("%d received an unexpected message from %d, type: %s, dropped", r.id, m.From, m.MsgType)
@@ -551,6 +569,9 @@ func (r *Raft) stepLeader(m pb.Message) error {
 
 // doElection is called by Followers when stepping MsgHup
 func (r *Raft) doElection() {
+	if !r.isValidID(r.id) {
+		return
+	}
 	r.becomeCandidate()
 	r.Vote = r.id
 	r.receiveVote(r.id, false) // vote itself
