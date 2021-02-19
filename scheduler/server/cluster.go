@@ -276,10 +276,74 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 	return nil
 }
 
+// epochStalerThan tells whether l is staler than r
+func epochStalerThan(l *metapb.RegionEpoch, r *metapb.RegionEpoch) bool {
+	// no need to check nil
+	return l.GetVersion() < r.GetVersion() || l.GetConfVer() < r.GetConfVer()
+}
+
+// checkStaleRegion will check the given region.
+// If there is a corresponding local region, check whether it is stale or not.
+// Or check in overlapped regions.
+// Return the search and check results.
+func (c *RaftCluster) checkStaleRegion(region *core.RegionInfo) (*core.RegionInfo, error) {
+	c.RLock()
+	defer c.RUnlock()
+	var err error = nil
+	var oldRegion *core.RegionInfo = nil
+	var newEpoch = region.GetRegionEpoch()
+	// find corresponding local region
+	if oldRegion = c.GetRegion(region.GetID()); oldRegion != nil {
+		if epochStalerThan(newEpoch, oldRegion.GetRegionEpoch()) {
+			err = ErrRegionIsStale(region.GetMeta(), oldRegion.GetMeta())
+		}
+	} else { // not found
+		// find overlapped regions
+		oRegions := c.core.GetOverlaps(region)
+		for _, r := range oRegions {
+			if epochStalerThan(newEpoch, r.GetRegionEpoch()) {
+				err = ErrRegionIsStale(region.GetMeta(), r.GetMeta())
+				break
+			}
+		}
+	}
+	return oldRegion, err
+}
+
+func (c *RaftCluster) updateRegionInfo(region *core.RegionInfo) {
+	c.Lock()
+	defer c.Unlock()
+	c.core.PutRegion(region)
+	// scan stores, find imbalance and move region
+	for storeId := range region.GetStoreIds() {
+		c.updateStoreStatusLocked(storeId)
+	}
+}
+
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
-	// Your Code Here (3C).
-
+	oldRegion, err := c.checkStaleRegion(region)
+	if err != nil {
+		return err
+	}
+	// check for update
+	// 0. No corresponding local region
+	if oldRegion == nil {
+		c.updateRegionInfo(region)
+		return nil
+	}
+	// 1. If the new one's version or conf_ver is greater than the original one.
+	getNewerEpoch := epochStalerThan(oldRegion.GetRegionEpoch(), region.GetRegionEpoch())
+	// 2. If the leader changed, it cannot be skipped.
+	leaderChanged := oldRegion.GetLeader().GetId() != region.GetLeader().GetId()
+	// 3. If the new one or original one has pending peer , it cannot be skipped.
+	hasPendingPeer := len(oldRegion.GetPendingPeers()) > 0 || len(region.GetPendingPeers()) > 0
+	// 4. If the ApproximateSize changed, it cannot be skipped.
+	approximateSizeChanged := region.GetApproximateSize() != oldRegion.GetApproximateSize()
+	peerChanged := len(oldRegion.GetPeers()) != len(region.GetPeers())
+	if getNewerEpoch || leaderChanged || hasPendingPeer || approximateSizeChanged || peerChanged {
+		c.updateRegionInfo(region)
+	}
 	return nil
 }
 
@@ -374,6 +438,11 @@ func (c *RaftCluster) GetRegionByID(regionID uint64) (*metapb.Region, *metapb.Pe
 // GetRegion searches for a region by ID.
 func (c *RaftCluster) GetRegion(regionID uint64) *core.RegionInfo {
 	return c.core.GetRegion(regionID)
+}
+
+// GetOverlapRegions searches for regions that overlap with the given one.
+func (c *RaftCluster) GetOverlapRegions(region *core.RegionInfo) []*core.RegionInfo {
+	return c.core.GetOverlaps(region)
 }
 
 // GetMetaRegions gets regions from cluster.
