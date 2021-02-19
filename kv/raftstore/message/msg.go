@@ -40,7 +40,7 @@ const (
 	MsgTypeStoreStart MsgType = 107
 
 	// message of records of callbacks
-	MsgTypeApplyProposals MsgType = 201
+	MsgTypeApply MsgType = 201
 	// message of apply result
 	MsgTypeApplyResult MsgType = 202
 )

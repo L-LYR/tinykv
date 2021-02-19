@@ -48,9 +48,6 @@ func (r *Raft) handlePropose(m pb.Message) error {
 
 	entries := m.Entries
 	log.Debugf("%d begin to propose %d entries", r.id, len(entries))
-	// check valid id
-	// check leadTransferee
-	// check PendingConf
 	lastIdx := r.RaftLog.LastIndex()
 	for i := range entries {
 		entries[i].Term = r.Term
@@ -98,6 +95,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		term, err := rl.Term(entry.Index)
 		if err != nil || term != entry.Term {
 			rl.appendEntries(m.Entries[i:])
+			break
 		}
 	}
 	toCommit := min(m.Commit, m.Index+uint64(len(m.Entries)))
@@ -111,6 +109,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 func (r *Raft) handleAppendResponse(m pb.Message) {
 	pr := r.Prs[m.From]
 	spr := r.sPrs[m.From]
+	spr.alive = true
 	if m.Reject {
 		// non-leader node refused to append
 		// leader could bring a follower's log
@@ -153,6 +152,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleHeartbeatResponse handle HeartbeatResponse RPC response
 func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	pr := r.Prs[m.From]
+	spr := r.sPrs[m.From]
+	spr.alive = true
 	if pr.Match < r.RaftLog.LastIndex() {
 		r.sendAppend(m.From)
 	}
@@ -202,6 +203,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	r.sendAppendResponse(m.From, false, r.RaftLog.LastIndex())
 }
 
+// handleSnapshot handle TransferLeader RPC request
 func (r *Raft) handleTransferLeader(m pb.Message) {
 	if !r.isValidID(m.From) {
 		// invalid id
@@ -240,7 +242,6 @@ func (r *Raft) isValidID(id uint64) bool {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
-	r.PendingConfIndex = None
 	if !r.isValidID(id) {
 		r.Prs[id] = &Progress{
 			Match: 0,
@@ -250,23 +251,26 @@ func (r *Raft) addNode(id uint64) {
 			state:      StateNormal,
 			resendTick: 0,
 			pendingIdx: 0,
+			alive:      true,
 		}
 	}
+	//var prsList []string
+	//for i := range r.Prs {
+	//prsList = append(prsList, fmt.Sprint(i))
+	//}
+	//log.Infof("%d after add %d, current peers: %s, leader: %d", r.id, id, strings.Join(prsList, ","), r.Lead)
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
-	r.PendingConfIndex = None
 	if !r.isValidID(id) {
 		return
 	}
 	delete(r.Prs, id)
 	delete(r.sPrs, id)
-	if len(r.Prs) == 0 {
-		return
-	}
-	if r.State == StateLeader {
+
+	if r.id != id && r.State == StateLeader {
 		if r.doCommit() {
 			r.broadcast(func(id uint64) { r.sendAppend(id) }, true)
 		}
@@ -275,4 +279,9 @@ func (r *Raft) removeNode(id uint64) {
 			r.transferLeaderElapsed = 0
 		}
 	}
+	//var prsList []string
+	//for i := range r.Prs {
+	//prsList = append(prsList, fmt.Sprint(i))
+	//}
+	//log.Infof("%d after remove %d, current peers: %s, leader: %d", r.id, id, strings.Join(prsList, ","), r.Lead)
 }

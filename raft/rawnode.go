@@ -155,21 +155,20 @@ func (rn *RawNode) Ready() Ready {
 	r := rn.Raft
 	l := r.RaftLog
 	rd := Ready{
+		SoftState:        nil,
+		HardState:        pb.HardState{},
 		Entries:          l.unstableEntries(),
 		CommittedEntries: l.nextEnts(),
+		Messages:         r.msgs,
 	}
-	if len(r.msgs) > 0 {
-		rd.Messages = r.msgs
-		r.msgs = nil
-	}
-
+	r.msgs = nil
 	if ss := r.curSoftState(); !isSoftStateEqual(ss, rn.pss) {
 		rd.SoftState = ss
 	}
 	if hs := r.curHardState(); !isHardStateEqual(hs, rn.phs) {
 		rd.HardState = hs
 	}
-	if l.pendingSnapshot != nil {
+	if !IsEmptySnap(l.pendingSnapshot) {
 		rd.Snapshot = *r.RaftLog.pendingSnapshot
 	}
 	return rd
@@ -188,7 +187,7 @@ func (rn *RawNode) HasReady() bool {
 	// hard state changed
 	hsc := !isHardStateEqual(rn.phs, r.curHardState())
 	// has snapshot
-	hs := s != nil && !IsEmptySnap(s)
+	hs := !IsEmptySnap(s)
 	return lc || ssc || hsc || hs
 }
 
@@ -211,16 +210,20 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 	if !IsEmptySnap(&rd.Snapshot) {
 		i := rd.Snapshot.Metadata.Index
+		// advance stabled and applied here
 		l.stabled = max(l.stabled, i)
 		l.applied = max(l.applied, i)
 		s := l.pendingSnapshot
+		// match snap
 		if !IsEmptySnap(s) && s.Metadata.Index == i {
 			l.pendingSnapshot = nil
 		}
 	}
+	// using maybeCompact here makes more sense
+	l.maybeCompact()
+
 	r := rn.Raft
-	log.Debugf("After Advance Raft %d RaftLog: offset[%d] applied[%d] committed[%d] stabled[%d]",
-		r.id, l.offset, l.applied, l.stabled, l.committed)
+	log.Debugf("%d RaftLog: offset[%d] applied[%d] committed[%d] stabled[%d]", r.id, l.offset, l.applied, l.stabled, l.committed)
 }
 
 // GetProgress return the the Progress of this node and its peers, if this
@@ -238,4 +241,8 @@ func (rn *RawNode) GetProgress() map[uint64]Progress {
 // TransferLeader tries to transfer leadership to the given transferee.
 func (rn *RawNode) TransferLeader(transferee uint64) {
 	_ = rn.Raft.Step(pb.Message{MsgType: pb.MessageType_MsgTransferLeader, From: transferee})
+}
+
+func (rn *RawNode) HasSnap() bool {
+	return rn.Raft.RaftLog.pendingSnapshot != nil
 }

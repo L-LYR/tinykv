@@ -35,7 +35,7 @@ func (r *Raft) send(m pb.Message) {
 			sm := m.Snapshot.Metadata
 			info += fmt.Sprintf(", snapshot index: %d term: %d", sm.Index, sm.Term)
 		}
-		log.Debugf("%s", info)
+		log.Infof("%s", info)
 	}
 	r.msgs = append(r.msgs, m)
 }
@@ -74,7 +74,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendSnapshot sends snapshot to the given peer.
 func (r *Raft) sendSnapshot(to uint64) bool {
 	spr := r.sPrs[to]
-	if spr.state == StatePending {
+	if !spr.alive || spr.state == StatePending {
 		return false
 	}
 	snapshot, err := r.RaftLog.snapshot()
@@ -129,6 +129,7 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	r.send(m)
 }
 
+// sendTimeoutNow sends a timeout RPC to the given peer
 func (r *Raft) sendTimeoutNow(to uint64) {
 	r.leadTransferee = None
 	m := pb.Message{

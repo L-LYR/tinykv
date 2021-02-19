@@ -127,6 +127,7 @@ type Progress struct {
 // Because in 2C, there will be a lot of snapshot request, SnapProgress is used to tell
 // the leader whether and when to send or resend snapshot.
 type SnapProgress struct {
+	alive      bool // alive will prevent leader send snapshot to removed nodes.
 	state      SnapStateType
 	resendTick int
 	pendingIdx uint64
@@ -240,7 +241,7 @@ func newRaft(c *Config) *Raft {
 		r.Prs[id] = &Progress{}
 		prsList = append(prsList, fmt.Sprint(id))
 	}
-	log.Debugf("new Raft %d: peers[%s] RaftLog: offset[%d] applied[%d] committed[%d] stabled[%d]",
+	log.Infof("new Raft %d: peers[%s] RaftLog: offset[%d] applied[%d] committed[%d] stabled[%d]",
 		r.id, strings.Join(prsList, ","), l.offset, l.applied, l.stabled, l.committed)
 	return r
 }
@@ -413,6 +414,8 @@ func (r *Raft) becomeLeader() {
 		r.Prs[id].Next = lastIdx + 1
 		r.sPrs[id].state = StateNormal
 		r.sPrs[id].resendTick = 0
+		r.sPrs[id].alive = true
+		r.sPrs[id].pendingIdx = 0
 	}, false)
 	r.Prs[r.id].Match = lastIdx
 	log.Debugf("%d become Leader at term %d", r.id, r.Term)

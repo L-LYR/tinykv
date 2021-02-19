@@ -206,23 +206,20 @@ func (l *RaftLog) EntrySliceFrom(i uint64) ([]pb.Entry, error) {
 func (l *RaftLog) appendEntries(entps []*pb.Entry) {
 	// check whether the entries are committed.
 	veryFirstIdx := entps[0].Index
-	if veryFirstIdx <= l.committed {
-		log.Panic("appending committed entries")
+	if veryFirstIdx <= l.stabled {
+		log.Debugf("l.stabled move from %d to %d", l.stabled, veryFirstIdx-1)
+		l.stabled = veryFirstIdx - 1
 	}
-	if veryFirstIdx != l.LastIndex()+1 {
-		if veryFirstIdx <= l.stabled {
-			log.Debugf("l.stabled move from %d to %d", l.stabled, veryFirstIdx-1)
-			l.stabled = veryFirstIdx - 1
-		}
-		// drop the conflict ones, l.stabled may be moved forward
+	// drop the conflict ones, l.stabled may be moved forward
+	if len(l.entries) > 0 {
 		l.entries = append([]pb.Entry{}, l.entries[:veryFirstIdx-l.offset]...)
 	}
 	// truncate entries
 	for _, ent := range entps {
 		l.entries = append(l.entries, *ent)
 	}
-	// maybeCompact
-	l.maybeCompact()
+	// calling maybeCompact in every rawnode.advance makes more sense?
+	// l.maybeCompact()
 }
 
 // snapshot return the pending snapshot or call l.storage to generate one.

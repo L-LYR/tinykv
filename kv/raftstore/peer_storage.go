@@ -314,6 +314,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	}
 	log.Debugf("%s begin to append %d entries", ps.Tag, len(entries))
 	regid := ps.region.Id
+	prevLastIdx, _ := ps.LastIndex() // err == nil
 	lastEntry := entries[nEnt-1]
 	lastIdx := lastEntry.Index
 	lastTerm := lastEntry.Term
@@ -328,7 +329,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	}
 
 	// delete not committed log entries
-	prevLastIdx, _ := ps.LastIndex() // err == nil
 	if prevLastIdx > lastIdx {
 		for i := lastIdx + 1; i <= prevLastIdx; i++ {
 			logKey := meta.RaftLogKey(regid, i)
@@ -367,31 +367,18 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		Region:     snapData.Region,
 	}
 
+	ps.snapState.StateType = snap.SnapState_Applying
 	// update states
 	sm := snapshot.Metadata
 	pr := ps.raftState
-	pr.LastIndex, pr.LastTerm = sm.Index, sm.Term
+	pa := ps.applyState
 	ps.region = snapData.Region
-
-	// save apply state
-	as := &rspb.RaftApplyState{
-		AppliedIndex: sm.Index,
-		TruncatedState: &rspb.RaftTruncatedState{
-			Index: sm.Index,
-			Term:  sm.Term,
-		},
-	}
-	ps.applyState = as
-	key := meta.ApplyStateKey(ps.region.Id)
-	if err := kvWB.SetMeta(key, as); err != nil {
-		return nil, err
-	}
-
+	pr.LastIndex, pr.LastTerm = sm.Index, sm.Term
+	pa.AppliedIndex = sm.Index
+	pa.TruncatedState.Index = sm.Index
+	pa.TruncatedState.Term = sm.Term
 	// schedule task apply
 	notifier := make(chan bool)
-	ps.snapState = snap.SnapState{
-		StateType: snap.SnapState_Applying,
-	}
 	ps.regionSched <- &runner.RegionTaskApply{
 		RegionId: ps.region.Id,
 		Notifier: notifier,
@@ -399,7 +386,17 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		StartKey: snapData.Region.StartKey,
 		EndKey:   snapData.Region.EndKey,
 	}
-	<-notifier
+	// log.Infof("Send to regionSched!")
+	res := <-notifier
+	if !res {
+		log.Panic("%s fail to apply snapshot!", ps.Tag)
+	}
+	// log.Infof("Apply Snapshot Finished!")
+	ps.snapState.StateType = snap.SnapState_Relax
+	key := meta.ApplyStateKey(ps.region.Id)
+	if err := kvWB.SetMeta(key, pa); err != nil {
+		return nil, err
+	}
 	meta.WriteRegionState(kvWB, ps.region, rspb.PeerState_Normal)
 	return asr, nil
 }

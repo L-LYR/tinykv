@@ -272,7 +272,11 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	go sw.run(bs.closeCh, bs.wg)
 	router.sendStore(message.Msg{Type: message.MsgTypeStoreStart, Data: ctx.store})
 	aw := newApplyWorker(ctx, rw.applyCh, router)
-	go aw.run(bs.closeCh, bs.wg)
+	// use bs.closeCh to close applyWorker may cause some
+	// unexpect unknown errors, such as key errors, request timeout......
+	// By experimenting, applyWorker should be destroyed after the raftWorker.
+	// So now raftWorker sends a nil to applyCh to make applyWorker stop itself.
+	go aw.run(bs.wg)
 	for i := 0; i < len(peers); i++ {
 		regionID := peers[i].regionId
 		_ = router.send(regionID, message.Msg{RegionID: regionID, Type: message.MsgTypeStart})

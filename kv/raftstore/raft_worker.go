@@ -40,6 +40,7 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 		msgs = msgs[:0]
 		select {
 		case <-closeCh:
+			rw.applyCh <- nil
 			return
 		case msg := <-rw.raftCh:
 			msgs = append(msgs, msg)
@@ -78,13 +79,10 @@ func (rw *raftWorker) getPeerState(peersMap map[uint64]*peerState, regionID uint
 // It gets msgs from raftWorker through applyCh.
 // Its implementation is similar with raftWorker.
 type applyWorker struct {
-	pr  *router
-	ctx *GlobalContext
-
+	pr      *router
+	ctx     *GlobalContext
 	applyCh chan []message.Msg
-	closeCh <-chan struct{}
-
-	aCtx *applyContext
+	aCtx    *applyContext
 }
 
 func newApplyWorker(ctx *GlobalContext, applyCh chan []message.Msg, pr *router) *applyWorker {
@@ -96,15 +94,22 @@ func newApplyWorker(ctx *GlobalContext, applyCh chan []message.Msg, pr *router) 
 	}
 }
 
-func (aw *applyWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
+func (aw *applyWorker) run(wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		select {
-		case <-closeCh:
-			return
 		case msgs := <-aw.applyCh:
+			if msgs == nil {
+				return
+			}
 			for _, msg := range msgs {
 				// handle apply
+				// TODO: divide apply messages into different types
+				// I was going to design different kind of apply messages to
+				// distinguish 'proposals', 'committedEntries' and 'confChange'.
+				// But when i put my idea down on the code, i find it is quite complex,
+				// so i mixed them into one message.
+				// That is to say, msg has only one type and len(msgs) == 1.
 				ps := aw.pr.get(msg.RegionID)
 				if ps == nil {
 					continue

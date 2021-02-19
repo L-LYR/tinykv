@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"time"
 
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
@@ -62,6 +64,13 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 
+	// still applying pending snap
+	if d.RaftGroup.HasSnap() &&
+		d.LastApplyingIndex != d.peerStorage.applyState.AppliedIndex {
+		log.Infof("%s has pending snapshot", d.Tag)
+		return
+	}
+
 	if !d.RaftGroup.HasReady() {
 		return
 	}
@@ -78,34 +87,48 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		pRegion, cRegion := res.PrevRegion, res.Region
 		log.Infof("%s snapshot for region %s is applied", d.Tag, cRegion)
 		m := d.ctx.storeMeta
+		m.Lock()
+		m.setRegion(cRegion, d.peer)
 		if len(pRegion.Peers) > 0 {
 			log.Infof("region changed from %s to %s", pRegion, cRegion)
 			m.regionRanges.Delete(&regionItem{region: pRegion})
 		}
 		m.regionRanges.ReplaceOrInsert(&regionItem{region: cRegion})
-		m.regions[cRegion.Id] = cRegion
+		m.Unlock()
+		d.LastApplyingIndex = d.peerStorage.AppliedIndex()
 	}
 
-	if len(rd.Messages) > 0 {
-		d.Send(d.ctx.trans, rd.Messages)
-	}
+	d.Send(d.ctx.trans, rd.Messages)
 
-	if cLen := len(rd.CommittedEntries); cLen > 0 {
-		applyMsgs = append(applyMsgs, message.Msg{
-			Type:     message.MsgTypeApplyProposals,
-			RegionID: d.regionId,
-			Data: &MsgApplyProposal{
-				proposals: d.proposals,
-				entries:   rd.CommittedEntries,
-			},
+	// wrap proposal in ApplyCmd
+	cmds := make([]*message.ApplyCmd, 0)
+	for _, p := range d.proposals {
+		cmds = append(cmds, &message.ApplyCmd{
+			Index: p.index,
+			Term:  p.term,
+			Cb:    p.cb,
 		})
-		d.LastApplyingIndex = rd.CommittedEntries[cLen-1].Index
-		d.proposals = nil
 	}
 
-	d.RaftGroup.Advance(rd)
+	applyMsgs = append(applyMsgs, message.Msg{
+		Type:     message.MsgTypeApply,
+		RegionID: d.regionId,
+		Data: &message.MsgApply{
+			Id:      d.PeerId(),
+			Term:    d.Term(),
+			Region:  d.Region(),
+			Update:  res != nil,
+			Cmds:    cmds,
+			Entries: rd.CommittedEntries,
+		},
+	})
+	if curLen := len(rd.CommittedEntries); curLen > 0 && res == nil {
+		d.LastApplyingIndex = rd.CommittedEntries[curLen-1].Index
+	}
+	d.proposals = nil
 
 	d.applyCh <- applyMsgs
+	d.RaftGroup.Advance(rd)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -132,7 +155,7 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	case message.MsgTypeStart:
 		d.startTicker()
 	case message.MsgTypeApplyResult:
-		applyRes := msg.Data.(*MsgApplyResult)
+		applyRes := msg.Data.(*message.MsgApplyResult)
 		d.onApplyResult(applyRes)
 	}
 }
@@ -181,52 +204,113 @@ func (d *peerMsgHandler) appendProposal(idx uint64, cb *message.Callback) {
 	})
 }
 
-//func (d *peerMsgHandler) proposeCompactLog(admin *raft_cmdpb.AdminRequest) (uint64, error) {
-//	data, err := admin.Marshal()
-//	if err != nil {
-//		return 0, err
-//	}
-//	idx := d.nextProposalIndex()
-//	err = d.RaftGroup.Propose(data)
-//	if err != nil {
-//		return 0, err
-//	}
-//	if idx == d.nextProposalIndex() {
-//		// no leader error
-//		return 0, fmt.Errorf("proposal message dropped")
-//	}
-//	return idx, nil
-//}
-
-func (d *peerMsgHandler) proposeAdminReq(req *raft_cmdpb.RaftCmdRequest) (uint64, error) {
-	admin := req.AdminRequest
-	switch admin.CmdType {
-	case raft_cmdpb.AdminCmdType_CompactLog:
-		// CompactLog is just like the normal request
-		return d.proposeNormalReq(req)
-	default:
-		log.Panicf("Unexpect Req!")
-	}
-	return 0, nil
-}
-
-func (d *peerMsgHandler) proposeNormalReq(req *raft_cmdpb.RaftCmdRequest) (uint64, error) {
+func (d *peerMsgHandler) proposeReq(req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	var err error
 	data, err := req.Marshal()
 	if err != nil {
-		return 0, err
+		log.Panic(err)
 	}
 	idx := d.nextProposalIndex()
 	err = d.RaftGroup.Propose(data)
 	if err != nil {
-		return 0, err
+		cb.Done(ErrResp(err))
+		return
 	}
-	if idx == d.nextProposalIndex() {
-		// no leader error
-		return 0, fmt.Errorf("proposal message dropped")
-	}
+	d.appendProposal(idx, cb)
+}
 
-	return idx, nil
+func (d *peerMsgHandler) handleLeaderTransfer(id uint64, cb *message.Callback) {
+	d.RaftGroup.TransferLeader(id)
+	resp := newCmdResp()
+	resp.AdminResponse = &raft_cmdpb.AdminResponse{
+		CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+		TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+	}
+	cb.Done(resp)
+}
+
+// TODO: use proposeReq in proposeChangePeer, make all the propose function more simple and uniform
+func (d *peerMsgHandler) proposeChangePeer(req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	var err error
+	// has pending conf change msg
+	if d.RaftGroup.Raft.PendingConfIndex >
+		d.peerStorage.applyState.AppliedIndex {
+		err = errors.New("Has pending config change msg")
+		cb.Done(ErrResp(err))
+		return
+	}
+	data, err := req.Marshal()
+	if err != nil {
+		log.Panic(err)
+	}
+	idx := d.nextProposalIndex()
+	cp := req.AdminRequest.ChangePeer
+	err = d.RaftGroup.ProposeConfChange(pb.ConfChange{
+		ChangeType: cp.ChangeType,
+		NodeId:     cp.Peer.Id,
+		Context:    data,
+	})
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+	d.appendProposal(idx, cb)
+}
+
+func (d *peerMsgHandler) proposeSplit(req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	key := req.AdminRequest.Split.SplitKey
+	if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+	d.proposeReq(req, cb)
+}
+
+func (d *peerMsgHandler) proposeAdminReq(req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	admin := req.AdminRequest
+	switch admin.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		// CompactLog is just like the normal request
+		// Actually it has no callback.
+		d.proposeReq(req, cb)
+	case raft_cmdpb.AdminCmdType_TransferLeader:
+		// handled in the previous layer
+		d.handleLeaderTransfer(admin.TransferLeader.Peer.Id, cb)
+	case raft_cmdpb.AdminCmdType_ChangePeer:
+		d.proposeChangePeer(req, cb)
+	case raft_cmdpb.AdminCmdType_Split:
+		d.proposeSplit(req, cb)
+	default:
+		log.Panicf("Unreachable")
+	}
+}
+
+func (d *peerMsgHandler) proposeNormalReq(req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	region := d.Region()
+	for _, r := range req.Requests {
+		var key []byte
+		switch r.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			key = r.Get.Key
+		case raft_cmdpb.CmdType_Put:
+			key = r.Put.Key
+		case raft_cmdpb.CmdType_Delete:
+			key = r.Delete.Key
+		case raft_cmdpb.CmdType_Snap:
+			key = nil
+		}
+		if key == nil {
+			continue
+		}
+		// must check key here
+		// Or assertion will be triggered in OneSplitTest
+		if err := util.CheckKeyInRegion(key, region); err != nil {
+			log.Info("request's key is not in region")
+			cb.Done(ErrResp(err))
+			return
+		}
+	}
+	d.proposeReq(req, cb)
 }
 
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
@@ -243,17 +327,11 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	// Your Code Here (2B).
 	// bind term
 	// identify what kind of request it is.
-	var i uint64
 	if msg.AdminRequest != nil {
-		i, err = d.proposeAdminReq(msg)
+		d.proposeAdminReq(msg, cb)
 	} else if len(msg.Requests) > 0 {
-		i, err = d.proposeNormalReq(msg)
+		d.proposeNormalReq(msg, cb)
 	}
-	if err != nil {
-		cb.Done(ErrResp(err))
-		return
-	}
-	d.appendProposal(i, cb)
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -712,16 +790,127 @@ func newCompactLogRequest(regionID uint64, peer *metapb.Peer, compactIndex, comp
 	return req
 }
 
-func (d *peerMsgHandler) onApplyResult(res *MsgApplyResult) {
-	d.peerStorage.applyState = res.applyState
-	for _, r := range res.results {
-		switch r.resType {
-		case ResType_CompactLog:
-			if d.LastCompactedIdx < r.compactLogIndex {
-				// without this check
-				// it will print a lot of 'no need to gc' infos.
-				d.ScheduleCompactLog(r.compactLogIndex)
+// handle apply results from applyMsgHandler
+func (d *peerMsgHandler) onApplyResult(res *message.MsgApplyResult) {
+	d.peerStorage.applyState = res.ApplyState
+	curSizeDiff := int64(d.SizeDiffHint) + res.SizeDiffHint
+	if curSizeDiff > 0 {
+		d.SizeDiffHint = uint64(curSizeDiff)
+	} else {
+		d.SizeDiffHint = 0
+	}
+	for _, r := range res.Results {
+		switch r.ResType {
+		case message.ResType_CompactLog:
+			if d.LastCompactedIdx < r.CompactLogIndex {
+				// Without this check,
+				// it will print a lot of annoying 'no need to gc' infos.
+				d.ScheduleCompactLog(r.CompactLogIndex)
 			}
+		case message.ResType_ChangePeer:
+			d.onConfChangeRes(&r)
+		case message.ResType_SplitRegion:
+			d.onSplitRegionRes(&r)
 		}
 	}
 }
+
+func (d *peerMsgHandler) onConfChangeRes(r *message.ApplyResult) {
+	// log.Infof("%s on config change result", d.Tag)
+	// log.Infof("previous region: %s", d.Region())
+	// log.Infof("new region: %s", r.newRegion)
+	cc := r.ConfChange
+	// d.updateRegion(r.newRegion)
+
+	m := d.ctx.storeMeta
+	m.Lock()
+	m.regionRanges.Delete(&regionItem{region: d.Region()})
+	m.setRegion(r.NewRegion, d.peer)
+	m.regionRanges.ReplaceOrInsert(&regionItem{region: r.NewRegion})
+	m.Unlock()
+
+	switch cc.ChangeType {
+	case pb.ConfChangeType_AddNode:
+		if d.IsLeader() {
+			d.PeersStartPendingTime[r.Peer.Id] = time.Now()
+		}
+		d.insertPeerCache(r.Peer)
+	case pb.ConfChangeType_RemoveNode:
+		if d.IsLeader() {
+			delete(d.PeersStartPendingTime, r.Peer.Id)
+		}
+		d.removePeerCache(r.Peer.Id)
+	}
+	d.RaftGroup.ApplyConfChange(*cc)
+	if d.IsLeader() {
+		// log.Infof("%s notify heartbeat scheduler at %s", d.Tag, d.Region())
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	}
+	if cc.ChangeType == pb.ConfChangeType_RemoveNode && cc.NodeId == d.PeerId() {
+		d.destroyPeer()
+	}
+}
+
+func (d *peerMsgHandler) onSplitRegionRes(r *message.ApplyResult) {
+	// notice: here d is still in the r.oldRegion
+	// d.updateRegion(r.oldRegion)
+
+	// see in onSplitRegionCheckTick
+	// nil is meaningless, just as a trigger
+	d.ApproximateSize = nil
+
+	// must be atomic, or it will get stuck here
+	m := d.ctx.storeMeta
+	m.Lock()
+	m.regionRanges.Delete(&regionItem{region: d.Region()})
+	m.setRegion(r.OldRegion, d.peer)
+	m.regions[r.NewRegion.Id] = r.NewRegion
+	m.regionRanges.ReplaceOrInsert(&regionItem{region: r.OldRegion})
+	m.regionRanges.ReplaceOrInsert(&regionItem{region: r.NewRegion})
+	m.Unlock()
+
+	// create new peers in new region
+	newPeer, err := createPeer(d.ctx.store.Id, d.ctx.cfg,
+		d.ctx.regionTaskSender, d.ctx.engine, r.NewRegion)
+	if err != nil {
+		log.Panic(err)
+	}
+	// log.Infof("%d create new peers %s", d.regionId, newPeer)
+	for _, p := range r.NewRegion.Peers {
+		newPeer.insertPeerCache(p)
+	}
+	// start workers, same in store_worker
+	d.ctx.router.register(newPeer)
+	_ = d.ctx.router.send(r.NewRegion.Id,
+		message.NewPeerMsg(message.MsgTypeStart, r.NewRegion.Id, nil))
+	// log.Infof("start worker")
+	// leader should schedule heartbeat to update info
+	if d.IsLeader() {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+		// this peer is likely to become leader, send a heartbeat immediately.
+		newPeer.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+		newPeer.MaybeCampaign(true)
+	}
+	// must handle the pending vote requests which are for the new peers
+	m.Lock()
+	restVotes := make([]*rspb.RaftMessage, 0)
+	for _, v := range m.pendingVotes {
+		if util.PeerEqual(v.ToPeer, newPeer.Meta) {
+			_ = d.ctx.router.send(r.NewRegion.Id,
+				message.NewPeerMsg(message.MsgTypeRaftMessage, r.NewRegion.Id, v))
+		} else {
+			restVotes = append(restVotes, v)
+		}
+	}
+	m.pendingVotes = restVotes
+	m.Unlock()
+}
+
+//func (d *peerMsgHandler) updateRegion(newRegion *metapb.Region) {
+//	m := d.ctx.storeMeta
+//	m.Lock()
+//	m.regionRanges.Delete(&regionItem{region: d.Region()})
+//	m.setRegion(newRegion, d.peer)
+//	m.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+//	m.Unlock()
+//}
