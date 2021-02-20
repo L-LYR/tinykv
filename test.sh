@@ -6,6 +6,7 @@ RaftTestLoc="./raft"
 RaftStoreTestLoc="./kv/test_raftstore"
 SchedulerServerLoc="./scheduler/server"
 SchedulerLoc="./scheduler/server/schedulers"
+TransactionLoc="./kv/transaction/..."
 
 Project1TestArgs=("1")
 Project2ATestArgs=("2A")
@@ -51,6 +52,7 @@ Project3BTestArgs=(
 )
 # shellcheck disable=SC2140
 Project3CTestArgs=("-check.f="3C"")
+Project4TestArgs=("4A" "4B" "4C")
 
 i=0
 FailedTest=()
@@ -61,7 +63,8 @@ doTest() {
     cmd="$GOTEST $2 $3 $arg"
     set -x
     if ! $cmd; then
-      FailedTest[$i]=${TestArr[$i]}
+      set +x
+      FailedTest[$i]=$arg
       i=$((i + 1))
     fi
     set +x
@@ -84,6 +87,8 @@ elif [ "$1" == "project3b" ]; then
 elif [ "$1" == "project3c" ]; then
   doTest "${Project3CTestArgs[*]}" $SchedulerServerLoc
   doTest "${Project3CTestArgs[*]}" $SchedulerLoc
+elif [ "$1" == "project4" ]; then
+  doTest "${Project4TestArgs[*]}" $TransactionLoc "-run"
 fi
 
 if [ ${#FailedTest[*]} -ne 0 ]; then
