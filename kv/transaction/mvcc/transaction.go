@@ -246,3 +246,43 @@ func decodeKey(key []byte) (uint64, []byte) {
 func PhysicalTime(ts uint64) uint64 {
 	return ts >> tsoutil.PhysicalShiftBits
 }
+
+// CheckKeyConflict will check whether the key conflicts with other txn.
+// If so, return (keyError, nil), If not, return (nil, nil).
+// If occurring an error, return (nil, err).
+func (txn *MvccTxn) CheckKeyConflict(key []byte, primary []byte) (*kvrpcpb.KeyError, error) {
+	write, commitTs, err := txn.MostRecentWrite(key)
+	if err != nil {
+		return nil, err
+	}
+	if commitTs >= txn.StartTS { // conflict
+		return &kvrpcpb.KeyError{
+			Conflict: &kvrpcpb.WriteConflict{
+				StartTs:    txn.StartTS,
+				ConflictTs: write.StartTS,
+				Key:        key,
+				Primary:    primary,
+			},
+		}, nil
+	}
+	return nil, nil
+}
+
+// CheckKeyLocked will check whether the key is locked.
+// If locked by another txn, return (keyError, lock, nil).
+// If locked, return (nil, lock, nil).
+// If not locked, return (nil, nil, nil).
+// If occurring an error, return (nil, nil, err).
+func (txn *MvccTxn) CheckKeyLocked(key []byte) (*kvrpcpb.KeyError, *Lock, error) {
+	lock, err := txn.GetLock(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	// locked by another txn
+	if lock != nil && lock.Ts != txn.StartTS {
+		return &kvrpcpb.KeyError{
+			Locked: lock.Info(key),
+		}, lock, nil
+	}
+	return nil, lock, nil
+}

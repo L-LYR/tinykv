@@ -2,6 +2,10 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"reflect"
+
+	"github.com/pingcap-incubator/tinykv/kv/transaction/mvcc"
 
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
@@ -35,20 +39,34 @@ func NewServer(storage storage.Storage) *Server {
 
 // The below functions are Server's gRPC API (implements TinyKvServer).
 
+// It is mentioned in project4 doc that any request might cause a region error.
+// But there is not a interface for all kinds of response types, so we use
+// reflect here to bind the region error to resp.
+func bindError(resp interface{}, err error) {
+	res := reflect.ValueOf(resp)
+	if castRes, ok := err.(*raft_storage.RegionError); ok {
+		res.FieldByName("RegionError").Set(reflect.ValueOf(castRes))
+	} else {
+		res.FieldByName("Error").SetString(err.Error())
+	}
+}
+
 // Raw API.
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
 	ss := server.storage
 	resp := &kvrpcpb.RawGetResponse{}
 
-	sr, err := ss.Reader(req.Context)
+	sr, err := ss.Reader(req.GetContext())
 	if err != nil {
+		bindError(resp, err)
 		return resp, err
 	}
 	defer sr.Close()
 
 	val, err := sr.GetCF(req.GetCf(), req.GetKey())
 	if err != nil {
+		bindError(resp, err)
 		return resp, err
 	}
 	resp.Value = val
@@ -63,19 +81,16 @@ func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kv
 	ss := server.storage
 	resp := &kvrpcpb.RawPutResponse{}
 
-	err := ss.Write(req.Context, []storage.Modify{
-		{
-			Data: storage.Put{
-				Cf:    req.GetCf(),
-				Key:   req.GetKey(),
-				Value: req.GetValue(),
-			},
+	err := ss.Write(req.GetContext(), []storage.Modify{{
+		Data: storage.Put{
+			Cf:    req.GetCf(),
+			Key:   req.GetKey(),
+			Value: req.GetValue(),
 		},
-	})
+	}})
 
 	if err != nil {
-		//? when and how to set RegionError
-		resp.Error = err.Error()
+		bindError(resp, err)
 		return resp, err
 	}
 
@@ -87,17 +102,15 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 	ss := server.storage
 	resp := &kvrpcpb.RawDeleteResponse{}
 
-	err := ss.Write(req.Context, []storage.Modify{
-		{
-			Data: storage.Delete{
-				Key: req.GetKey(),
-				Cf:  req.GetCf(),
-			},
+	err := ss.Write(req.GetContext(), []storage.Modify{{
+		Data: storage.Delete{
+			Key: req.GetKey(),
+			Cf:  req.GetCf(),
 		},
-	})
+	}})
 
 	if err != nil {
-		resp.Error = err.Error()
+		bindError(resp, err)
 		return resp, err
 	}
 
@@ -109,8 +122,9 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 	ss := server.storage
 	resp := &kvrpcpb.RawScanResponse{}
 
-	sr, err := ss.Reader(req.Context)
+	sr, err := ss.Reader(req.GetContext())
 	if err != nil {
+		bindError(resp, err)
 		return resp, err
 	}
 	defer sr.Close()
@@ -126,10 +140,8 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 		key := curItem.KeyCopy(nil)
 		val, err := curItem.ValueCopy(nil)
 		if err != nil {
-			// I think if there occurs an error, 'Abort' should be set.
-			// But I cannot find anywhere else using the KeyError.
-			// So I do not know this response is right or not.
-			kvPair.Error = &kvrpcpb.KeyError{Abort: err.Error()}
+			bindError(resp, err)
+			return resp, err
 		}
 		kvPair.Key = key
 		kvPair.Value = val
@@ -155,17 +167,160 @@ func (server *Server) Snapshot(stream tinykvpb.TinyKv_SnapshotServer) error {
 // Transactional API.
 func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcpb.GetResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	ss := server.storage
+	resp := &kvrpcpb.GetResponse{}
+	sr, err := ss.Reader(req.GetContext())
+	if err != nil {
+		bindError(resp, err)
+		return resp, err
+	}
+	defer sr.Close()
+
+	txn := mvcc.NewMvccTxn(sr, req.GetVersion())
+	lock, err := txn.GetLock(req.GetKey())
+	if err != nil {
+		bindError(resp, err)
+		return resp, err
+	}
+
+	// check whether the target key is locked
+	if lock != nil && lock.IsLockedFor(req.GetKey(), txn.StartTS, resp) {
+		return resp, nil
+	}
+
+	val, err := txn.GetValue(req.GetKey())
+	if err != nil {
+		bindError(resp, err)
+		return resp, err
+	}
+
+	resp.Value = val
+	resp.NotFound = val == nil
+	return resp, nil
 }
 
 func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest) (*kvrpcpb.PrewriteResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	ss := server.storage
+	resp := &kvrpcpb.PrewriteResponse{}
+	sr, err := ss.Reader(req.GetContext())
+	if err != nil {
+		bindError(resp, err)
+		return resp, err
+	}
+	defer sr.Close()
+
+	txn := mvcc.NewMvccTxn(sr, req.GetStartVersion())
+
+	// get keys
+	var keys [][]byte
+	for _, k := range req.GetMutations() {
+		keys = append(keys, k.GetKey())
+	}
+
+	// waite for latches
+	ls := server.Latches
+	ls.WaitForLatches(keys)
+	defer ls.ReleaseLatches(keys)
+
+	var keyError *kvrpcpb.KeyError = nil
+	for _, m := range req.GetMutations() {
+		keyError, err = txn.CheckKeyConflict(m.GetKey(), req.GetPrimaryLock())
+		if err != nil { // occur an error
+			bindError(resp, err)
+			return resp, err
+		}
+
+		// not conflict, check for lock
+		if keyError == nil {
+			keyError, _, err = txn.CheckKeyLocked(m.GetKey())
+		}
+
+		if err != nil { // occur an error
+			bindError(resp, err)
+			return resp, err
+		}
+
+		if keyError != nil { // conflict or locked
+			resp.Errors = append(resp.Errors, keyError)
+			continue
+		}
+
+		// no key error
+		txn.PutLock(m.GetKey(), &mvcc.Lock{
+			Primary: req.GetPrimaryLock(),
+			Ts:      txn.StartTS,
+			Ttl:     req.GetLockTtl(),
+			Kind:    mvcc.WriteKindFromProto(m.GetOp()),
+		})
+		txn.PutValue(m.GetKey(), m.GetValue())
+	}
+
+	// only for test
+	ls.Validation(txn, keys)
+
+	// write
+	if err = ss.Write(req.GetContext(), txn.Writes()); err != nil {
+		bindError(resp, err)
+		return resp, err
+	}
+
+	return resp, nil
 }
 
 func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*kvrpcpb.CommitResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	ss := server.storage
+	resp := &kvrpcpb.CommitResponse{}
+	sr, err := ss.Reader(req.GetContext())
+	if err != nil {
+		bindError(resp, err)
+		return resp, err
+	}
+	defer sr.Close()
+
+	txn := mvcc.NewMvccTxn(sr, req.GetStartVersion())
+
+	ls := server.Latches
+	ls.WaitForLatches(req.GetKeys())
+	defer ls.ReleaseLatches(req.GetKeys())
+	// same with prewrite
+
+	for _, key := range req.GetKeys() {
+		// check for lock
+		keyError, lock, err := txn.CheckKeyLocked(key)
+		if err != nil { // occur an error
+			bindError(resp, err)
+			return resp, err
+		}
+		if lock == nil { // not locked, fail to commit
+			return resp, nil
+		}
+		if keyError != nil { // locked by another txn
+			// It is mentioned in kvrpcpb.proto that
+			// client may restart the txn. e.g write conflict.
+			// So here we should set the keyError.retryable.
+			keyError.Retryable = fmt.Sprintf("Locked by another txn.")
+			resp.Error = keyError
+			return resp, nil
+		}
+		// commit
+		txn.PutWrite(key, req.GetCommitVersion(), &mvcc.Write{
+			StartTS: txn.StartTS,
+			Kind:    lock.Kind,
+		})
+		txn.DeleteLock(key)
+	}
+
+	ls.Validation(txn, req.GetKeys())
+
+	// write
+	if err = ss.Write(req.GetContext(), txn.Writes()); err != nil {
+		bindError(resp, err)
+		return resp, err
+	}
+
+	return resp, nil
 }
 
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {
