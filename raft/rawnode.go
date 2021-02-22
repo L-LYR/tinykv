@@ -219,8 +219,7 @@ func (rn *RawNode) Advance(rd Ready) {
 			l.pendingSnapshot = nil
 		}
 	}
-	// using maybeCompact here makes more sense
-	l.maybeCompact()
+	//l.maybeCompact()
 
 	r := rn.Raft
 	log.Debugf("%d RaftLog: offset[%d] applied[%d] committed[%d] stabled[%d]", r.id, l.offset, l.applied, l.stabled, l.committed)

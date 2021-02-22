@@ -221,8 +221,8 @@ func (l *RaftLog) appendEntries(entps []*pb.Entry) {
 	for _, ent := range entps {
 		l.entries = append(l.entries, *ent)
 	}
-	// calling maybeCompact in every rawnode.advance makes more sense?
-	// l.maybeCompact()
+	//? calling maybeCompact in every rawnode.advance makes more sense?
+	l.maybeCompact()
 }
 
 // snapshot return the pending snapshot or call l.storage to generate one.
