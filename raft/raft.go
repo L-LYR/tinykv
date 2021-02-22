@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/pingcap-incubator/tinykv/log"
 
@@ -138,6 +140,25 @@ type SnapProgress struct {
 	state      SnapStateType
 	resendTick int
 	pendingIdx uint64 // pendingIdx is used to save the last snapshot's index, it will be checked in responses.
+}
+
+// lockedRand is a random number generator with a mutex.
+// It plays an important role in the synchronization of multi-raft.
+type lockedRand struct {
+	lock sync.Mutex
+	rand *rand.Rand
+}
+
+func (r *lockedRand) randIntn(n int) int {
+	r.lock.Lock()
+	val := r.rand.Intn(n)
+	r.lock.Unlock()
+	return val
+}
+
+// global Random Number Generator
+var gRNG = &lockedRand{
+	rand: rand.New(rand.NewSource(time.Now().UnixNano())),
 }
 
 type Raft struct {
@@ -376,7 +397,7 @@ func (r *Raft) resetStateInfo() {
 	// re-rand when changing state
 	// This can control the ratio of conflicts.
 	r.randomElectionTimeout =
-		r.electionTimeout + rand.Intn(r.electionTimeout)
+		r.electionTimeout + gRNG.randIntn(r.electionTimeout)
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	r.transferLeaderElapsed = 0
