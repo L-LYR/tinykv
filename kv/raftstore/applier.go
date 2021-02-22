@@ -29,19 +29,6 @@ func newApplier(peer *peer) *applier {
 	}
 }
 
-//func (a *applier) copyRegion() *metapb.Region {
-//	newRegion := &metapb.Region{}
-//	data, err := proto.Marshal(a.region)
-//	if err != nil {
-//		log.Panic(err)
-//	}
-//	err = newRegion.Unmarshal(data)
-//	if err != nil {
-//		log.Panic(err)
-//	}
-//	return newRegion
-//}
-
 // if there is a snapshot applied, applier must update its infos
 // and clear all stale cmds.
 func (a *applier) update(m *message.MsgApply) {
@@ -54,6 +41,7 @@ func (a *applier) update(m *message.MsgApply) {
 	a.region = m.Region
 }
 
+// clear will clear up all the stale requests.
 func (a *applier) clear() {
 	for _, p := range a.cmds {
 		NotifyStaleReq(a.term, p.Cb)

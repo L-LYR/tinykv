@@ -35,7 +35,7 @@ func (r *Raft) send(m pb.Message) {
 			sm := m.Snapshot.Metadata
 			info += fmt.Sprintf(", snapshot index: %d term: %d", sm.Index, sm.Term)
 		}
-		log.Infof("%s", info)
+		log.Debugf("%s", info)
 	}
 	r.msgs = append(r.msgs, m)
 }

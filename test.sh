@@ -89,6 +89,17 @@ elif [ "$1" == "project3c" ]; then
   doTest "${Project3CTestArgs[*]}" $SchedulerLoc
 elif [ "$1" == "project4" ]; then
   doTest "${Project4TestArgs[*]}" $TransactionLoc "-run"
+elif [ "$1" == "all" ]; then
+  doTest "${Project1TestArgs[*]}" $ServerTestLoc "-run"
+  doTest "${Project2ATestArgs[*]}" $RaftTestLoc "-run"
+  doTest "${Project2BTestArgs[*]}" $RaftStoreTestLoc "-run"
+  doTest "${Project2CRaftTestArgs[*]}" $RaftTestLoc "-run"
+  doTest "${Project2CStoreTestArgs[*]}" $RaftStoreTestLoc "-run"
+  doTest "${Project3ATestArgs[*]}" $RaftTestLoc "-run"
+  doTest "${Project3BTestArgs[*]}" $RaftStoreTestLoc "-run"
+  doTest "${Project3CTestArgs[*]}" $SchedulerServerLoc
+  doTest "${Project3CTestArgs[*]}" $SchedulerLoc
+  doTest "${Project4TestArgs[*]}" $TransactionLoc "-run"
 fi
 
 if [ ${#FailedTest[*]} -ne 0 ]; then

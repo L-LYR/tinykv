@@ -55,6 +55,7 @@ type RaftLog struct {
 	// Your Data Here (2A).
 	// offset is the upperbound of the compacted logs(snapshot)
 	// the beginning index of entries
+	// it is used for changes between the entry.index and entry slice's index.
 	offset uint64
 }
 
@@ -129,6 +130,8 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	return l.entries[beginIdx-l.offset : l.committed+1-l.offset]
 }
 
+// hasUnstableEnts and hasNextEnts are used in the rawnode.HasReady(),
+// to show whether the logs have changed.
 func (l *RaftLog) hasUnstableEnts() bool {
 	return l.stabled < l.LastIndex()
 }
@@ -230,6 +233,8 @@ func (l *RaftLog) snapshot() (pb.Snapshot, error) {
 	return l.storage.Snapshot()
 }
 
+// storeSnap is called in Raft.handleSnapshot() to update RaftLog's info.
+// Notice: stabled and applied will also be updated in rawnode.Advance.
 func (l *RaftLog) storeSnap(s *pb.Snapshot) {
 	sm := s.Metadata
 	l.committed = sm.Index

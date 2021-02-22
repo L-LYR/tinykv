@@ -63,13 +63,17 @@ func (a *applyMsgHandler) appendCallback(cb *message.Callback) {
 	a.cbs = append(a.cbs, cb)
 }
 
+// handleApplyMsg is called in Apply_Worker.
+// It will do some pre-checks and then begin to handle apply commands.
+// In the end it will send results to peerMsgHandler.
 func (a *applyMsgHandler) handleApplyMsg(msg message.Msg) {
+	// pre-check
 	// check messageType
 	if msg.Type != message.MsgTypeApply {
 		log.Panicf("error message type: %s", msg.Type)
 	}
 
-	// update applier or deal with stale ApplyCmds
+	// update applier
 	m := msg.Data.(*message.MsgApply)
 	a.term = m.Term
 
@@ -78,7 +82,7 @@ func (a *applyMsgHandler) handleApplyMsg(msg message.Msg) {
 		m.Entries = nil
 		a.update(m)
 	}
-
+	// deal with stale ApplyCmds
 	if a.removed {
 		// log.Infof("%s is removed, clear all", a.tag)
 		a.clear()
@@ -129,6 +133,10 @@ func (a *applyMsgHandler) done() {
 	}
 }
 
+// apply will check the entry
+// 1. empty entry
+// 2. unmarshal request, broken entry
+// 3. check region epoch
 func (a *applyMsgHandler) apply(entry *pb.Entry) {
 	// empty entry
 	// for example, if there is a pending confChange entry,
@@ -269,7 +277,7 @@ func (a *applyMsgHandler) handleSplitRegion(admin *raft_cmdpb.AdminRequest, resp
 	var err error
 	oldRegion := a.copyRegion()
 	split := admin.Split
-	// check key length ?
+	// check key length or nil ?
 	//if len(key) == 0 {
 	//	err = errors.New("split key is missing")
 	//	BindRespError(resp, err)
@@ -383,8 +391,8 @@ func (a *applyMsgHandler) handleNormalRequests(entry *pb.Entry, req *raft_cmdpb.
 		if key == nil {
 			continue
 		}
-		// Confusing: Is it useless to check whether the key is in region here?
-		// It is checked in peerMsgHandler.proposeRaftCommand
+		// TODO: Is it useless to check whether the key is in region here?
+		// It is already checked in peerMsgHandler.proposeRaftCommand
 		if err := util.CheckKeyInRegion(key, a.region); err != nil {
 			log.Info("request's key is not in region")
 			cb.Done(ErrResp(err))
@@ -409,18 +417,18 @@ func (a *applyMsgHandler) handleNormalRequests(entry *pb.Entry, req *raft_cmdpb.
 			a.wb.SetCF(putReq.Cf, putReq.Key, putReq.Value)
 			diffSize = len(putReq.Cf) + len(putReq.Key) + len(putReq.Value)
 			a.res.SizeDiffHint += int64(diffSize)
-			//log.Infof("%s put %s %s %s", a.tag, putReq.Cf, putReq.Key, putReq.Value)
+			// log.Infof("%s put %s %s %s", a.tag, putReq.Cf, putReq.Key, putReq.Value)
 		case raft_cmdpb.CmdType_Delete:
 			deleteReq := r.Delete
 			a.wb.DeleteCF(deleteReq.Cf, deleteReq.Key)
 			diffSize = len(deleteReq.Cf) + len(deleteReq.Key)
 			a.res.SizeDiffHint -= int64(diffSize)
-			//log.Infof("%s delete %s %s", a.tag, deleteReq.Cf, deleteReq.Key)
+			// log.Infof("%s delete %s %s", a.tag, deleteReq.Cf, deleteReq.Key)
 		case raft_cmdpb.CmdType_Get:
 			getReq := r.Get
 			val, _ := engine_util.GetCF(a.aCtx.engines.Kv, getReq.Cf, getReq.Key)
 			res.Get = &raft_cmdpb.GetResponse{Value: val}
-			//log.Infof("%s get %s %s %s", a.tag, getReq.Cf, getReq.Key, val)
+			// log.Infof("%s get %s %s %s", a.tag, getReq.Cf, getReq.Key, val)
 		case raft_cmdpb.CmdType_Snap:
 			txn = a.aCtx.engines.Kv.NewTransaction(false)
 			res.Snap = &raft_cmdpb.SnapResponse{Region: a.region}
@@ -436,38 +444,3 @@ func (a *applyMsgHandler) handleNormalRequests(entry *pb.Entry, req *raft_cmdpb.
 		a.appendCallback(cb)
 	}
 }
-
-//func (a *applyMsgHandler) response(r *raft_cmdpb.Request) (*raft_cmdpb.Response, *badger.Txn) {
-//	res := &raft_cmdpb.Response{
-//		CmdType: r.CmdType,
-//	}
-//	var txn *badger.Txn = nil
-//	switch r.CmdType {
-//	case raft_cmdpb.CmdType_Get:
-//		a.doCurrentWB()
-//		getReq := r.Get
-//		val, _ := engine_util.GetCF(a.aCtx.engines.Kv, getReq.Cf, getReq.Key)
-//		res.Get = &raft_cmdpb.GetResponse{Value: val}
-//		log.Infof("%s get %s %s %s", a.tag, getReq.Cf, getReq.Key, val)
-//	case raft_cmdpb.CmdType_Snap:
-//		a.doCurrentWB()
-//		txn = a.aCtx.engines.Kv.NewTransaction(false)
-//		res.Snap = &raft_cmdpb.SnapResponse{Region: a.region}
-//	case raft_cmdpb.CmdType_Put:
-//		res.Put = &raft_cmdpb.PutResponse{}
-//	case raft_cmdpb.CmdType_Delete:
-//		res.Delete = &raft_cmdpb.DeleteResponse{}
-//	}
-//	return res, txn
-//}
-
-//func (a *applyMsgHandler) doCurrentWB() {
-//	//log.Infof("%d write to db", a.id)
-//	key := meta.ApplyStateKey(a.region.Id)
-//	err := a.aCtx.wb.SetMeta(key, a.aCtx.res.applyState)
-//	if err != nil {
-//		log.Panic(err)
-//	}
-//	a.aCtx.wb.MustWriteToDB(a.aCtx.engines.Kv)
-//	a.aCtx.wb.Reset()
-//}

@@ -39,8 +39,12 @@ func NewServer(storage storage.Storage) *Server {
 
 // The below functions are Server's gRPC API (implements TinyKvServer).
 
+// TODO: To implement two handlers for Raw Commands and KV Commands.
+// Because the KV Commands need MVCC txn, it is hard to implement one
+// kind handler.
+
 // It is mentioned in project4 doc that any request might cause a region error.
-// But there is not a interface for all kinds of response types, so we use
+// But there is not an interface for all kinds of response types, so we use
 // reflect here to bind the region error to resp.
 func bindError(resp interface{}, err error) {
 	res := reflect.ValueOf(resp)
@@ -253,6 +257,7 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 			Ttl:     req.GetLockTtl(),
 			Kind:    mvcc.WriteKindFromProto(m.GetOp()),
 		})
+
 		switch mvcc.WriteKindFromProto(m.GetOp()) {
 		case mvcc.WriteKindPut:
 			txn.PutValue(m.GetKey(), m.GetValue())

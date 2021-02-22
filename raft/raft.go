@@ -126,11 +126,18 @@ type Progress struct {
 
 // Because in 2C, there will be a lot of snapshot request, SnapProgress is used to tell
 // the leader whether and when to send or resend snapshot.
+// To avoid too many snapshots, in etcd's implementation, Progress helps leader to record
+// the snapshot state and tells leader how to interact with followers.
+// To not modify the origin structure of the code, I made it an another struct to save the snapshot info.
+// Reference: https://github.com/etcd-io/etcd/blob/master/raft/tracker/progress.go
 type SnapProgress struct {
-	alive      bool // alive will prevent leader send snapshot to removed nodes.
+	alive bool // alive will prevent leader send snapshot to removed nodes.
+	// In StateNormal, leader should send at most one snapshot and change the state to StateNormal.
+	// In StatePending, leader should not send any replication message.
+	// When resendTick comes to a timeout, StatePending will be reset.
 	state      SnapStateType
 	resendTick int
-	pendingIdx uint64
+	pendingIdx uint64 // pendingIdx is used to save the last snapshot's index, it will be checked in responses.
 }
 
 type Raft struct {
@@ -215,6 +222,7 @@ func newRaft(c *Config) *Raft {
 		randomElectionTimeout: c.ElectionTick + rand.Intn(c.ElectionTick),
 	}
 
+	// recover tests
 	hs, cs, err := c.Storage.InitialState()
 	if err != nil {
 		log.Panic(err)
@@ -235,13 +243,14 @@ func newRaft(c *Config) *Raft {
 		prs = cs.Nodes
 	}
 
+	// initialize the progress and show the context for debug
 	var prsList []string
 	for _, id := range prs {
 		r.sPrs[id] = &SnapProgress{}
 		r.Prs[id] = &Progress{}
 		prsList = append(prsList, fmt.Sprint(id))
 	}
-	log.Infof("new Raft %d: peers[%s] RaftLog: offset[%d] applied[%d] committed[%d] stabled[%d]",
+	log.Debugf("new Raft %d: peers[%s] RaftLog: offset[%d] applied[%d] committed[%d] stabled[%d]",
 		r.id, strings.Join(prsList, ","), l.offset, l.applied, l.stabled, l.committed)
 	return r
 }
@@ -335,6 +344,8 @@ func (r *Raft) tickResendSnap() {
 	}, true)
 }
 
+// tickTransferLeader will be called by leader.
+// When it comes to a timeout, the transferLeader operation will abort.
 func (r *Raft) tickTransferLeader() {
 	r.transferLeaderElapsed++
 	if r.leadTransferee != None && r.transferLeaderElapsed >= r.electionTimeout {
@@ -402,9 +413,9 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
-	// Well, in the ./doc/project2-RaftKV.md, it said that
-	// 'The tests assume that the newly elected leader should append a noop entry on its term'.
-	//! I think 'append' is different with 'propose' in this project.
+	//! Well, in the ./doc/project2-RaftKV.md, it said that
+	//! 'The tests assume that the newly elected leader should append a noop entry on its term'.
+	//! I think 'append' is different from 'propose' in this project.
 	r.resetStateInfo()
 	r.State = StateLeader
 	r.Lead = r.id
@@ -423,7 +434,7 @@ func (r *Raft) becomeLeader() {
 		MsgType: pb.MessageType_MsgPropose,
 		Entries: []*pb.Entry{{Data: nil}},
 	})
-	//r.appendEntries([]*pb.Entry{{Data: nil}})
+	// r.appendEntries([]*pb.Entry{{Data: nil}})
 }
 
 // Step the entrance of handle message, see `MessageType`

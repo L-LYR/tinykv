@@ -85,12 +85,12 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if res != nil {
 		// previous region & current region
 		pRegion, cRegion := res.PrevRegion, res.Region
-		log.Infof("%s snapshot for region %s is applied", d.Tag, cRegion)
+		log.Debugf("%s snapshot for region %s is applied", d.Tag, cRegion)
 		m := d.ctx.storeMeta
 		m.Lock()
 		m.setRegion(cRegion, d.peer)
 		if len(pRegion.Peers) > 0 {
-			log.Infof("region changed from %s to %s", pRegion, cRegion)
+			log.Debugf("region changed from %s to %s", pRegion, cRegion)
 			m.regionRanges.Delete(&regionItem{region: pRegion})
 		}
 		m.regionRanges.ReplaceOrInsert(&regionItem{region: cRegion})
@@ -101,6 +101,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	d.Send(d.ctx.trans, rd.Messages)
 
 	// wrap proposal in ApplyCmd
+	// TODO: proposal is just the same with ApplyCmd; using one of them is enough.
 	cmds := make([]*message.ApplyCmd, 0)
 	for _, p := range d.proposals {
 		cmds = append(cmds, &message.ApplyCmd{
@@ -117,7 +118,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			Id:      d.PeerId(),
 			Term:    d.Term(),
 			Region:  d.Region(),
-			Update:  res != nil,
+			Update:  res != nil, // no snapshot
 			Cmds:    cmds,
 			Entries: rd.CommittedEntries,
 		},
@@ -846,7 +847,9 @@ func (d *peerMsgHandler) onConfChangeRes(r *message.ApplyResult) {
 		// log.Infof("%s notify heartbeat scheduler at %s", d.Tag, d.Region())
 		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 	}
-	if cc.ChangeType == pb.ConfChangeType_RemoveNode && cc.NodeId == d.PeerId() {
+	if cc.ChangeType == pb.ConfChangeType_RemoveNode &&
+		cc.NodeId == d.PeerId() &&
+		r.Peer.StoreId == d.storeID() {
 		d.destroyPeer()
 	}
 }
@@ -905,12 +908,3 @@ func (d *peerMsgHandler) onSplitRegionRes(r *message.ApplyResult) {
 	m.pendingVotes = restVotes
 	m.Unlock()
 }
-
-//func (d *peerMsgHandler) updateRegion(newRegion *metapb.Region) {
-//	m := d.ctx.storeMeta
-//	m.Lock()
-//	m.regionRanges.Delete(&regionItem{region: d.Region()})
-//	m.setRegion(newRegion, d.peer)
-//	m.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
-//	m.Unlock()
-//}
